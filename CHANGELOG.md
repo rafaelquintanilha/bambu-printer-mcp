@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Fixed
+- Remove the unsupported top-level TLS option from the FFmpeg RTSP command. FFmpeg 7.1 can capture an enabled X2D camera stream over encrypted RTSPS instead of failing with `Option tls_verify not found`.
 - Diagnose X2D camera capture failures when the printer reports LAN Only Liveview is disabled. Explain the touchscreen camera setting separately from LAN Only Mode, preserve other capture errors, and keep the file-transfer port out of camera routing.
 
 ### Added

@@ -2706,6 +2706,10 @@ test("camera_snapshot uses trusted FFMPEG_PATH without opening per-call selector
     `#!/usr/bin/env node
 import fs from "node:fs";
 fs.writeFileSync(${JSON.stringify(argsPath)}, JSON.stringify(process.argv.slice(2)));
+if (process.argv.includes("-tls_verify")) {
+  console.error("Option tls_verify not found.");
+  process.exit(8);
+}
 fs.writeFileSync(process.argv.at(-1), Buffer.from([0xff, 0xd8, 0x00, 0x11, 0xff, 0xd9]));
 `,
     { mode: 0o755 }
@@ -2740,9 +2744,9 @@ fs.writeFileSync(process.argv.at(-1), Buffer.from([0xff, 0xd8, 0x00, 0x11, 0xff,
   assert.equal(result.isError, undefined);
   assert.equal(parseJsonResult(result).transport, "rtsps-322");
   const ffmpegArgs = JSON.parse(fs.readFileSync(argsPath, "utf8"));
-  const tlsVerifyIndex = ffmpegArgs.indexOf("-tls_verify");
-  assert.notEqual(tlsVerifyIndex, -1, "RTSP should explicitly handle the printer's self-signed TLS certificate");
-  assert.equal(ffmpegArgs[tlsVerifyIndex + 1], "0");
+  assert.equal(ffmpegArgs.includes("-tls_verify"), false, "FFmpeg 7.1 rejects this protocol-only option on RTSP input");
+  assert.match(ffmpegArgs[ffmpegArgs.indexOf("-i") + 1], /^rtsps:\/\//, "capture keeps TLS encryption");
+  assert.equal(ffmpegArgs[ffmpegArgs.indexOf("-rtsp_transport") + 1], "tcp");
 });
 
 test("stdio transport: initialize, list tools, call success + structured failure", async (t) => {
