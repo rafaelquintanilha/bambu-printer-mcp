@@ -632,6 +632,8 @@ Two transports are wired in, picked by `bambu_model`:
 
 **Requires ffmpeg in PATH** for the RTSP path. Install with `brew install ffmpeg` on macOS. Configure a trusted custom binary with the server-side `FFMPEG_PATH` environment variable, or set `MCP_ALLOW_EXECUTABLE_ARG=1` before using the `ffmpeg_path` tool argument. The TCP-on-6000 path uses native Node TLS and does not require ffmpeg.
 
+On X2D, enable **LAN Only Liveview** on the printer touchscreen. This is a separate camera setting from LAN Only Mode. Cloud liveview can work while local RTSPS is disabled. When capture fails, the tool checks the printer's reported camera state and explains this prerequisite if liveview is disabled; it does not change the setting or probe the file-transfer service on port 6000.
+
 ```json
 {
   "save_path": "/tmp/snap.jpg",

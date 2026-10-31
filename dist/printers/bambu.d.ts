@@ -171,7 +171,7 @@ export declare class BambuImplementation {
      *
      * Read-only; no confirm gate. Default 8s timeout for cold-start latency.
      */
-    cameraSnapshot(host: string, _serial: string, token: string, options?: {
+    cameraSnapshot(host: string, serial: string, token: string, options?: {
         savePath?: string;
         timeoutMs?: number;
         bambuModel?: string;

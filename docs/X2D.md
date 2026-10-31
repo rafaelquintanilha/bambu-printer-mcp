@@ -17,6 +17,8 @@ Model creation uses Blender; the server's built-in mesh tools edit existing STL 
 
 Status includes job identity, progress, remaining time, current layer and temperatures. Camera snapshots need `ffmpeg`. Status is retrieved on request; continuous monitoring or notifications are the MCP client's responsibility.
 
+Camera snapshots also require **LAN Only Liveview** to be enabled on the printer's touchscreen. This camera setting is separate from LAN Only Mode; cloud liveview in Bambu Studio can work while the local camera feed is disabled. The MCP uses authenticated RTSPS on port 322. Port 6000 on the X2D serves file transfers and is not a camera fallback. If capture fails and the printer reports `ipcam.rtsp_url: "disable"`, the tool explains which setting to enable.
+
 AMS slots are read live, rather than assuming a permanent colour or material in a slot. `resolve_3mf_ams_slots` matches a sliced project's filaments to the current inventory. `x2d_native_control` can update filament metadata using the upstream validated command format. Metadata changes do not physically load a different spool. Drying and other controls remain subject to installed hardware and upstream support. Manual positive nozzle heating is refused when the upstream checks cannot verify the active X2D nozzle/material.
 
 ## Local installation

@@ -1679,7 +1679,7 @@ export class BambuImplementation {
    */
   async cameraSnapshot(
     host: string,
-    _serial: string,
+    serial: string,
     token: string,
     options: {
       savePath?: string;
@@ -1733,7 +1733,25 @@ export class BambuImplementation {
     }
 
     if (RTSP_MODELS.has(model)) {
-      const jpeg = await this.fetchRtspCameraFrame(host, token, timeoutMs, options.ffmpegPath);
+      let jpeg: Buffer;
+      try {
+        jpeg = await this.fetchRtspCameraFrame(host, token, timeoutMs, options.ffmpegPath);
+      } catch (error) {
+        // X2D can keep cloud liveview working while its LAN RTSPS server is
+        // disabled. Diagnose that reported state; do not change printer settings
+        // or try the unrelated file-transfer service on port 6000.
+        if (model === "x2d") {
+          const status = await this.getStatus(host, serial, token);
+          if (status.connected && status.raw?.ipcam?.rtsp_url === "disable") {
+            throw Object.assign(new Error(
+              "camera_snapshot: the X2D reports LAN Only Liveview is disabled. " +
+              "Enable LAN Only Liveview on the printer touchscreen, then retry. " +
+              "This camera setting is separate from LAN Only Mode."
+            ), { cause: error });
+          }
+        }
+        throw error;
+      }
       const result: any = {
         status: "success",
         format: "image/jpeg",

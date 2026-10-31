@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Fixed
+- Diagnose X2D camera capture failures when the printer reports LAN Only Liveview is disabled. Explain the touchscreen camera setting separately from LAN Only Mode, preserve other capture errors, and keep the file-transfer port out of camera routing.
+
 ### Added
 - Add the `bambu-x2d-mcp` stdio entry point for a configured X2D and Bambu Studio, retaining model editing, optional Blender integration, slicing, AMS management, upload, printing and monitoring. Validate tool arguments, keep printer credentials and executable paths in local configuration, and reject tools outside the profile.
 - Keep X2D upload-only and print actions separate. Native print receipts expose the dispatched job identity; the X2D profile reports `dispatched` with `physicalPrintVerified: false` until the client independently checks printer status. Retain upstream hardware validation and human confirmation.

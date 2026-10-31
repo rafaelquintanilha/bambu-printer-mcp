@@ -1678,6 +1678,41 @@ test("camera_snapshot routes H2 series through RTSP (verified live on Parker H2S
   assert.equal(tcpCalls, 0, "TCP-on-6000 path should not run for H2");
 });
 
+test("X2D camera diagnoses disabled LAN liveview without probing the file-transfer port", async () => {
+  const bambu = new BambuImplementation();
+  const attempts = [];
+  bambu.fetchRtspCameraFrame = async () => { attempts.push("rtsp"); throw new Error("Connection refused"); };
+  bambu.fetchTcpCameraFrame = async () => assert.fail("port 6000 is not an X2D video fallback");
+  bambu.getStatus = async (host, serial, token) => {
+    assert.deepEqual([host, serial, token], ["127.0.0.1", "20PTEST", "ACCESS01"]);
+    attempts.push("status");
+    return { connected: true, raw: { ipcam: { rtsp_url: "disable" } } };
+  };
+  await assert.rejects(bambu.cameraSnapshot("127.0.0.1", "20PTEST", "ACCESS01", { bambuModel: "x2d" }),
+    error => {
+      assert.match(error.message, /Enable LAN Only Liveview on the printer touchscreen/);
+      assert.match(error.message, /separate from LAN Only Mode/);
+      assert.equal(error.cause.message, "Connection refused");
+      return true;
+    });
+  assert.deepEqual(attempts, ["rtsp", "status"]);
+});
+
+test("X2D camera preserves the capture error unless disabled liveview is actually reported", async () => {
+  const bambu = new BambuImplementation();
+  const captureError = new Error("ffmpeg decoder failed");
+  bambu.fetchRtspCameraFrame = async () => { throw captureError; };
+  for (const status of [
+    { connected: true, raw: { ipcam: { rtsp_url: "rtsps://127.0.0.1:322/streaming/live/1" } } },
+    { connected: true, raw: {} },
+    { connected: false, error: "MQTT unavailable" },
+  ]) {
+    bambu.getStatus = async () => status;
+    await assert.rejects(bambu.cameraSnapshot("127.0.0.1", "20PTEST", "ACCESS01", { bambuModel: "x2d" }),
+      error => error === captureError);
+  }
+});
+
 test("camera_snapshot routes X1/P2S through RTSP", async () => {
   const bambu = new BambuImplementation(async () => true);
   const fakeJpeg = Buffer.from([0xff, 0xd8, 0xab, 0xcd, 0xff, 0xd9]);
