@@ -9,7 +9,8 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
   ErrorCode,
-  McpError
+  McpError,
+  type Tool
 } from "@modelcontextprotocol/sdk/types.js";
 import dotenv from "dotenv";
 import fs from "fs";
@@ -49,8 +50,11 @@ import { externalStorageState, validatePrinterState } from "./safety/printer-sta
 import { isDualNozzleModel } from "./safety/limits.js";
 import { withPrinterOperation, withPrintSnapshot, uniquePrintName } from "./safety/artifact.js";
 import { detectProfilesRoot } from "./slicer/profile-flatten.js";
+import { configureX2dEnvironment, describeX2dResult, X2dToolProfile } from "./x2d-profile.js";
 
 dotenv.config();
+const X2D_PROFILE = process.env.MCP_PROFILE === "x2d";
+if (X2D_PROFILE) configureX2dEnvironment(process.env);
 
 const DEFAULT_HOST = process.env.BAMBU_PRINTER_HOST || process.env.PRINTER_HOST || "localhost";
 const DEFAULT_BAMBU_SERIAL = process.env.BAMBU_PRINTER_SERIAL || process.env.BAMBU_SERIAL || "";
@@ -1209,7 +1213,7 @@ class BambuPrinterMCPServer {
     this.runtimeConfig = readRuntimeConfig();
     this.server = new Server(
       {
-        name: "bambu-printer-mcp",
+        name: X2D_PROFILE ? "bambu-x2d-mcp" : "bambu-printer-mcp",
         version: JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8")).version
       },
       {
@@ -1729,7 +1733,7 @@ class BambuPrinterMCPServer {
         } });
         assertActive();
         this.bambu.recordCheckedJob(devIp, devId, remoteFileName, requirements);
-        return { ...nativeResult, autoSliced, projectName, plateIndex, useAMS, amsMapping: mapping };
+        return { ...nativeResult, autoSliced, projectName, printerJobName: checkedName, remoteProjectPath: remoteFileName, plateIndex, useAMS, amsMapping: mapping };
       }
       const bridgeOptions: BambuNetworkBridgeOptions = {
         ...this.bridgeOptionsFromArgs(args, "print_3mf_bambu_network"),
@@ -2190,6 +2194,9 @@ class BambuPrinterMCPServer {
       }
 
       const [, host, resource] = match;
+      if (X2D_PROFILE && host && host !== DEFAULT_HOST) {
+        throw new McpError(ErrorCode.InvalidParams, "The X2D profile only reads resources from its configured printer.");
+      }
       const bambuSerial = DEFAULT_BAMBU_SERIAL;
       const bambuToken = DEFAULT_BAMBU_TOKEN;
       let content;
@@ -2228,9 +2235,7 @@ class BambuPrinterMCPServer {
   }
 
   setupToolHandlers() {
-    this.server.setRequestHandler(ListToolsRequestSchema, async () => {
-      return {
-        tools: [
+    const tools: Tool[] = [
           {
             name: "get_printer_status",
             description: "Get the current status of the Bambu Lab printer",
@@ -3216,12 +3221,13 @@ class BambuPrinterMCPServer {
               additionalProperties: false
             }
           }
-        ]
-      };
-    });
+        ];
+    const profile = X2D_PROFILE ? new X2dToolProfile(tools) : undefined;
+    this.server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: profile?.tools ?? tools }));
 
     this.server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
-      const { name, arguments: args } = request.params;
+      const { name } = request.params;
+      const args = profile ? profile.prepare(name, request.params.arguments) : request.params.arguments;
       const sendNativeCommand = (
         options: Parameters<typeof sendCommandWithBambuNative>[0],
         execution: Parameters<typeof sendCommandWithBambuNative>[1] = {}
@@ -4452,6 +4458,7 @@ class BambuPrinterMCPServer {
         }
 
         await progressNotifications;
+        if (X2D_PROFILE) result = describeX2dResult(name, result);
         const text = typeof result === "string" ? result : JSON.stringify(result, null, 2);
 
         if (this.runtimeConfig.enableJsonResponse && typeof result === "object") {

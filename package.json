@@ -1,5 +1,6 @@
 {
   "name": "bambu-printer-mcp",
+  "private": true,
   "version": "1.1.43",
   "description": "MCP server for Bambu Lab 3D printers with STL manipulation, slicing, and print management",
   "main": "dist/index.js",
@@ -11,6 +12,7 @@
   "scripts": {
     "start": "node dist/index.js",
     "start:stdio": "MCP_TRANSPORT=stdio node dist/index.js",
+    "start:x2d": "node dist/x2d.js",
     "start:http": "MCP_TRANSPORT=streamable-http node dist/index.js",
     "build": "tsc",
     "test": "npm run build && node --test tests/*.test.mjs tests/**/*.test.mjs",
@@ -21,6 +23,7 @@
   },
   "bin": {
     "bambu-printer-mcp": "dist/index.js",
+    "bambu-x2d-mcp": "dist/x2d.js",
     "bambu-printer-mcp-native-setup": "scripts/setup-bambu-native.mjs"
   },
   "files": [

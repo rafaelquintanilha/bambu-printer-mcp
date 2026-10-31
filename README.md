@@ -1,5 +1,7 @@
 # bambu-printer-mcp
 
+This fork adds **`bambu-x2d-mcp`**, a local X2D workflow for MCP clients: model editing, Bambu Studio slicing, AMS management, upload, printing and monitoring. See the [X2D setup and tool guide](docs/X2D.md). The upstream executable and its safety checks remain available.
+
 [![bambu-printer-mcp — Print from a conversation. Browse the documentation site.](https://dmontgomery40.github.io/bambu-printer-mcp/social-card.png)](https://dmontgomery40.github.io/bambu-printer-mcp/)
 
 > **Thank you, [FULU Foundation](https://www.fulu.org/), [Louis Rossmann](https://www.youtube.com/watch?v=1jhRqgHxEP8), and the [OrcaSlicer-bambulab contributors](https://github.com/FULU-Foundation/OrcaSlicer-bambulab).** We stand with open-source developers, the right to repair, and your right to control hardware you own. You should be able to choose your software and print without a vendor cloud standing in the way.
