@@ -360,7 +360,7 @@ function runNativeHelper(mode, env, timeoutMs, onUpdate, execution = {}) {
                         void authorizeDispatch(trimmed);
                         continue;
                     }
-                    if (cloud && !/^native_(?:cloud_(?:session|server|query)|cloud_signing=(?:verified|rejected)$|cloud_device=(?:ready|timeout)$|cloud_capability_request=-?\d+$|update status=\d+ code=-?\d+$|print result=-?\d+$)/.test(trimmed))
+                    if (cloud && !/^native_(?:cloud_(?:session|server|query)|cloud_signing=(?:verified|rejected)$|cloud_device=(?:ready|timeout)$|cloud_capability_request=-?\d+$|cloud_failure status=-?\d+ code=-?\d+ step=[a-z0-9_]+(?: detail=-?\d+)?(?: http=-?\d+)?$|update status=\d+ code=-?\d+$|print result=-?\d+$)/.test(trimmed))
                         continue;
                     updates.push(trimmed);
                     onUpdate?.(trimmed);
@@ -767,7 +767,7 @@ export async function printWithBambuNative(options, onUpdate, execution) {
             throw new Error("Cloud printer capability report timed out before upload or dispatch; no job was submitted. Cloud login succeeded, but the selected printer did not finish its status handshake.");
         }
         if (cloud && result.authorizedAttempts > 0) {
-            throw new Error(`Bambu cloud print submission failed or is uncertain (helper ${result.resultCode}). Check the printer job and cloud history before any new submission; do not automatically resend or fall back to local printing. ${result.updates.filter(line => line.startsWith("native_print result=")).join("; ")}`);
+            throw new Error(`Bambu cloud print submission failed or is uncertain (helper ${result.resultCode}). Check the printer job and cloud history before any new submission; do not automatically resend or fall back to local printing. ${result.updates.filter(line => line.startsWith("native_print result=") || line.startsWith("native_cloud_failure ")).join("; ")}`);
         }
         const explicitRejection = result.updates.some(line => /^native_print result=-?[1-9]\d*$/.test(line));
         if (result.authorizedAttempts > 0 && (result.updates.includes("native_print result=0") || (result.signal && !explicitRejection))) {

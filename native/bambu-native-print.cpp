@@ -137,6 +137,21 @@ std::string envOr(const char *name, const std::string &fallback = {}) {
     return value && *value ? std::string(value) : fallback;
 }
 
+// Cloud failure messages look like "upload_3mf_config failed(<n>),code=<http>,
+// body=<response>". The body and any URL can carry signed storage or account
+// data, so report only the step name and the two numbers.
+std::string cloudFailureSummary(int status, int code, const std::string &message) {
+    static const std::regex step(R"(^([a-z0-9_]{1,48}) failed)");
+    static const std::regex detail(R"(^[a-z0-9_]{1,48} failed\((-?[0-9]{1,9})\))");
+    static const std::regex http(R"(^[a-z0-9_]{1,48} failed(?:\(-?[0-9]{1,9}\))?,code=(-?[0-9]{1,9}))");
+    std::smatch match;
+    std::string summary = "native_cloud_failure status=" + std::to_string(status) + " code=" + std::to_string(code);
+    summary += " step=" + (std::regex_search(message, match, step) ? match[1].str() : std::string("unknown"));
+    if (std::regex_search(message, match, detail)) summary += " detail=" + match[1].str();
+    if (std::regex_search(message, match, http)) summary += " http=" + match[1].str();
+    return summary;
+}
+
 std::string homeDir() {
 #if defined(__APPLE__)
     return envOr("HOME", "/Users/Shared");
@@ -774,6 +789,7 @@ void runOperation(NativeApi &api, NativeOperation operation) {
         }
         outputLine("native_update status=" + std::to_string(status) + " code=" +
                    std::to_string(code) + (cloud ? "" : " msg=" + message));
+        if (cloud && code < 0) outputLine(cloudFailureSummary(status, code, message));
     };
     const BBL::WasCancelledFn cancel = []() { return false; };
     const auto startAuthorizedPrint = [&](int attempt) {
@@ -952,18 +968,20 @@ void *createCloudAgent(const NativeApi &api) {
     const auto check = [](int result, const char *stage) {
         if (result != 0) throw std::runtime_error(std::string("cloud ") + stage + " failed: " + std::to_string(result));
     };
+    // Follow Studio's agent setup order: configuration, HTTP log, certificates,
+    // extra headers, region. init_log is required: without it the plug-in's own
+    // account requests return HTTP 401 although its cloud MQTT session works.
     check(api.setConfigDir(agent, directory), "configuration");
+    check(api.initLog(agent), "log");
     check(api.setCertFile(agent, defaultCertDir(), envOr("BAMBU_NATIVE_CERT_FILE", "slicer_base64.cer")), "certificates");
-    check(api.setCountryCode(agent, envOr("BAMBU_NATIVE_COUNTRY", "US")), "region");
+    // Studio sends only its X-BBL client identity here. The plug-in adds extra
+    // headers to every request, including presigned storage uploads, where an
+    // Authorization header conflicts with the URL's own signature.
     const auto headers = requiredSymbol<int (*)(void *, std::map<std::string, std::string>)>(api.handle, "bambu_network_set_extra_http_header");
-    std::ifstream bearerFile(directory + "/cloud-token");
-    std::string bearer; std::getline(bearerFile, bearer);
-    if (bearer.empty() || bearer.find_first_of("\r\n") != std::string::npos) throw std::runtime_error("cloud bearer session is missing");
-    const auto version = requiredSymbol<std::string (*)()>(api.handle, "bambu_network_get_version");
-    check(headers(agent, {{"Authorization", "Bearer " + bearer}, {"Accept", "application/json"},
-        {"User-Agent", "bambu_network_agent/" + version()}, {"X-BBL-Client-Type", "slicer"}, {"X-BBL-Client-Name", "BambuStudio"},
+    check(headers(agent, {{"X-BBL-Client-Type", "slicer"}, {"X-BBL-Client-Name", "BambuStudio"},
         {"X-BBL-Client-Version", envOr("BAMBU_NATIVE_STUDIO_VERSION")}, {"X-BBL-OS-Type", "macos"},
         {"X-BBL-Device-ID", envOr("BAMBU_NATIVE_STUDIO_DEVICE_ID")}, {"X-BBL-Language", "en"}}), "headers");
+    check(api.setCountryCode(agent, envOr("BAMBU_NATIVE_COUNTRY", "US")), "region");
     check(api.setQueueOnMain(agent, [](std::function<void()> callback) { if (callback) callback(); }), "callbacks");
     auto capabilities = std::make_shared<LocalConnectionState>();
     const auto send = requiredSymbol<SendMessageToPrinterFn>(api.handle, "bambu_network_send_message");

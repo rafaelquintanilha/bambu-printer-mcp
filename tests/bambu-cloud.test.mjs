@@ -57,8 +57,11 @@ test('disposable native cloud configuration is private and removed after failure
   await assert.rejects(withStudioCloudSession('20PTEST',undefined,async env=>{
     copied=env.BAMBU_NATIVE_CONFIG_DIR;
     assert.equal((await fs.stat(copied)).mode&0o777,0o700);
-    assert.equal((await fs.stat(path.join(copied,'cloud-token'))).mode&0o777,0o600);
-    assert.equal(await fs.readFile(path.join(copied,'cloud-token'),'utf8'),secret);
+    // The plug-in reads its own session file; no plain token copy is handed over.
+    assert.deepEqual(await fs.readdir(copied),['BambuNetworkEngine.conf']);
+    assert.equal((await fs.stat(path.join(copied,'BambuNetworkEngine.conf'))).mode&0o777,0o600);
+    assert.equal(env.BAMBU_NATIVE_STUDIO_VERSION,'02.08.04.61');
+    assert(!JSON.stringify(env).includes(secret));
     throw new Error('synthetic failure');
   }),/synthetic failure/);
   await assert.rejects(fs.stat(copied),{code:'ENOENT'});
@@ -115,10 +118,16 @@ std::function<void(std::string,std::string)> cloudMessage;
 std::function<void(std::string)> printerConnected;
 std::string selected;
 bool subscribed=false, active=false, capabilityDelivered=false, appCertUpdated=false;
+bool configured=false, logInitialized=false, certificatesSet=false, headersSet=false;
 extern "C" bool bambu_network_is_user_login(void*) { return true; }
 extern "C" std::string bambu_network_get_version() { return "02.08.04.60"; }
+// Studio's extra headers are client identity only. The plug-in adds them to
+// presigned storage uploads too, so credentials here break the job upload.
 extern "C" int bambu_network_set_extra_http_header(void*, std::map<std::string,std::string> headers) {
-  return headers["Authorization"]=="Bearer ${secret}" ? 0 : -1;
+  if(!certificatesSet || headers.count("Authorization") || headers.count("Accept") || headers.count("User-Agent")) return -1;
+  for(const auto& header : headers) if(header.first.rfind("X-BBL-",0)!=0 || header.second.find("${secret}")!=std::string::npos) return -1;
+  headersSet=headers["X-BBL-Client-Name"]=="BambuStudio" && headers["X-BBL-Client-Version"]=="02.08.04.61" && headers["X-BBL-Device-ID"]=="test-client";
+  return headersSet ? 0 : -1;
 }
 extern "C" int bambu_network_set_on_server_connected_fn(void*,std::function<void(int,int)> fn) { cloudConnected=fn; return 0; }
 extern "C" int bambu_network_connect_server(void*) { cloudConnected(0,0); return 0; }
@@ -137,6 +146,10 @@ extern "C" int bambu_network_send_message(void*,std::string serial,std::string m
 extern "C" int bambu_network_start_print(void*,BBL::PrintParams p,BBL::OnUpdateStatusFn update,BBL::WasCancelledFn,std::function<bool(int,std::string)> wait) {
   if(!capabilityDelivered) return -3140;
   if(p.connection_type!="cloud" || p.task_bed_type!="textured_plate" || p.plate_index!=1 || p.ams_mapping!="[2]" || p.nozzle_mapping!="[1,0]") return -99;
+  if(envOr("TEST_CLOUD_UPLOAD_FAIL")=="1") {
+    update(1,-3030,"upload_3mf_config failed(-1),code=400,body=<Error><Code>InvalidArgument</Code><Message>PRIVATE_SIGNED_URL</Message></Error>");
+    return -3030;
+  }
   update(1,100,"upload complete");
   update(3,0,"sending");
   std::ofstream receipt(envOr("TEST_CLOUD_RECEIPT")); receipt<<"submitted";receipt.close();
@@ -153,15 +166,17 @@ int main() {
   api.handle=dlopen(nullptr,RTLD_NOW|RTLD_GLOBAL);
   api.createAgent=[](std::string)->void*{return reinterpret_cast<void*>(1);};
   api.destroyAgent=[](void*){return 0;};
-  api.setConfigDir=[](void*,std::string){return 0;};
-  api.setCertFile=[](void*,std::string,std::string){return 0;};
-  api.setCountryCode=[](void*,std::string){return 0;};
+  api.setConfigDir=[](void*,std::string){configured=true;return 0;};
+  // Without init_log the plug-in's own account requests are unauthorized.
+  api.initLog=[](void*){if(!configured)return -1;logInitialized=true;return 0;};
+  api.setCertFile=[](void*,std::string,std::string){if(!logInitialized)return -1;certificatesSet=true;return 0;};
+  api.setCountryCode=[](void*,std::string){return headersSet?0:-1;};
   api.setQueueOnMain=[](void*,std::function<void(std::function<void()>)>){return 0;};
   api.setMessage=[](void*,std::function<void(std::string,std::string)> fn){cloudMessage=fn;return 0;};
   api.setPrinterConnected=[](void*,std::function<void(std::string)> fn){printerConnected=fn;return 0;};
   api.installDeviceCert=[](void*,std::string,bool lanOnly){if(lanOnly)std::abort();};
   api.updateCert=[](void*){appCertUpdated=true;return 0;};
-  api.start=[](void*){return 0;};
+  api.start=[](void*){return logInitialized && headersSet ? 0 : -1;};
   api.connectPrinter=[](void*,std::string,std::string,std::string,std::string,bool){std::abort();return -1;};
   api.startLocalPrint=[](void*,BBL::PrintParams,BBL::OnUpdateStatusFn,BBL::WasCancelledFn){std::abort();return -1;};
   try { if(!envOr("TEST_CLOUD_PROBE").empty())runCloudProbe(api);else runOperation(api,NativeOperation::CloudPrint); }
@@ -197,6 +212,20 @@ int main() {
   } finally { delete process.env.TEST_CLOUD_MISSING_FLAGS; }
   await assert.rejects(printWithBambuNative(options,undefined,{beforeDispatch:async()=>{if(++checks===2)throw new Error('Printer became busy');}}),/Printer became busy/);
   assert.equal(checks,2);await assert.rejects(fs.stat(receipt),{code:'ENOENT'});
+  checks=0;
+  const failureUpdates=[];
+  process.env.TEST_CLOUD_UPLOAD_FAIL='1';
+  try {
+    await assert.rejects(printWithBambuNative(options,line=>failureUpdates.push(line),{beforeDispatch:async()=>{checks++;}}),error=>{
+      assert.match(error.message,/do not automatically resend/);
+      assert.match(error.message,/native_cloud_failure status=1 code=-3030 step=upload_3mf_config detail=-1 http=400/);
+      assert.match(error.message,/native_print result=-3030/);
+      assert(!error.message.includes('PRIVATE_SIGNED_URL'));
+      return true;
+    });
+    assert.equal(checks,1);await assert.rejects(fs.stat(receipt),{code:'ENOENT'});
+    assert(!failureUpdates.join('\n').includes('PRIVATE_SIGNED_URL'));
+  } finally { delete process.env.TEST_CLOUD_UPLOAD_FAIL; }
   checks=0;
   assert.equal((await printWithBambuNative(options,undefined,{beforeDispatch:async()=>{checks++;}})).route,'bambu-cloud');
   assert.equal(checks,2);assert.equal(await fs.readFile(receipt,'utf8'),'submitted');

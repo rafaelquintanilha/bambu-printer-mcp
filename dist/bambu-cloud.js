@@ -79,8 +79,9 @@ export async function withStudioCloudSession(serial, signal, operation) {
     const directory = await fs.mkdtemp(path.join(os.tmpdir(), "bambu-cloud-"));
     try {
         await fs.chmod(directory, 0o700);
+        // The plug-in authenticates from this session file, as in Studio. No bearer
+        // header or token copy is passed to it.
         await fs.writeFile(path.join(directory, "BambuNetworkEngine.conf"), profile.encoded, { mode: 0o600 });
-        await fs.writeFile(path.join(directory, "cloud-token"), profile.session.user.token, { mode: 0o600 });
         signal?.throwIfAborted();
         return await operation({ BAMBU_NATIVE_CONFIG_DIR: directory, BAMBU_NATIVE_COUNTRY: profile.country,
             BAMBU_NATIVE_STUDIO_VERSION: profile.version, BAMBU_NATIVE_STUDIO_DEVICE_ID: profile.deviceId,
