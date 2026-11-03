@@ -18,7 +18,12 @@ export function compactX2dStatus(status, now = Date.now()) {
     const receivedAt = nullableNumber(status.observation?.receivedAt);
     const age = receivedAt === null ? null : Math.max(0, now - receivedAt);
     const state = typeof status.status === "string" ? status.status : "UNKNOWN";
-    const layer = nullableNumber(status.print?.currentLayer ?? raw.layer_num);
+    const stageCode = nullableNumber(raw.stg_cur);
+    const progress = nullableNumber(status.print?.progress);
+    // Right after a new job arrives, the X2D still reports the previous job's
+    // layer, with no print stage entered (stg_cur -1) and 0% progress.
+    const previousJobLayer = state === "RUNNING" && stageCode === -1 && progress === 0;
+    const layer = previousJobLayer ? null : nullableNumber(status.print?.currentLayer ?? raw.layer_num);
     const stage = state === "RUNNING" ? (layer !== null && layer > 0 ? "printing" : "preparing") :
         { PREPARE: "preparing", SLICING: "preparing", PAUSE: "paused", FINISH: "finished", FAILED: "failed", IDLE: "idle" }[state] ?? "unknown";
     const name = typeof status.print?.filename === "string" && status.print.filename !== "None" ? status.print.filename : null;
@@ -46,8 +51,8 @@ export function compactX2dStatus(status, now = Date.now()) {
             file: typeof raw.gcode_file === "string" ? raw.gcode_file : null,
             identity_quality: taskId || subtaskId || jobId ? "printer_id" : name || raw.gcode_file ? "filename" : "unknown",
             stage,
-            stage_code: nullableNumber(raw.stg_cur),
-            progress: nullableNumber(status.print?.progress),
+            stage_code: stageCode,
+            progress,
             timeRemaining: nullableNumber(status.print?.timeRemaining),
             time_remaining_unit: "minutes",
             currentLayer: layer,

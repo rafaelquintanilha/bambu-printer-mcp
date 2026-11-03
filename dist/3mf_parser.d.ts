@@ -1,6 +1,8 @@
 import { ThreeMFData, CollarCharmAnalysis, ThreeMFAmsRequirements, ThreeMFPlateObjects } from './types.js';
 export { ThreeMFData };
 export declare function parse3MF(filePath: string): Promise<ThreeMFData>;
+/** True when a 3MF is a Bambu/Orca project that carries its own slicer settings. */
+export declare function hasBambuProjectSettings(filePath: string): Promise<boolean>;
 export declare function extractBambuTemplateSettings(filePath: string, outputDir: string): Promise<string>;
 export declare function analyzeCollarCharm3MF(filePath: string, plateIndex?: number): Promise<CollarCharmAnalysis>;
 export declare function getCollarCharmRolePolicy(): {

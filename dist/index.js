@@ -17,7 +17,7 @@ import { BambuFileServiceError, listInternalPrinterFiles, uploadInternalPrinterF
 import { importFileViaBambuConnect } from "./bambu-connect.js";
 import { BlenderMcpBridge } from "./blender-mcp-bridge.js";
 import { bridgeAmsMapping2Entry, bridgeAmsMappingValue, externalTrayForNozzle, hasAmsMappingInput, normalizeAmsMappingObject, normalizeBridgeAmsTrayValue } from "./ams-mapping.js";
-import { analyze3MFAmsRequirements, analyze3MFPlateObjects, analyzeCollarCharm3MF, extractBambuTemplateSettings, getCollarCharmRolePolicy, parse3MF } from './3mf_parser.js';
+import { analyze3MFAmsRequirements, analyze3MFPlateObjects, analyzeCollarCharm3MF, extractBambuTemplateSettings, getCollarCharmRolePolicy, hasBambuProjectSettings, parse3MF } from './3mf_parser.js';
 import { BambuImplementation, assertDirectPrintSupported } from "./printers/bambu.js";
 import { inspectPrintFile } from "./safety/print-file.js";
 import { externalStorageState, unchippedNozzles, validatePrinterState } from "./safety/printer-state.js";
@@ -3517,7 +3517,12 @@ class BambuPrinterMCPServer {
                         const { slicerType, slicerPath, slicerProfile } = this.resolveSlicerConfigFromArgs(args, "slice_stl");
                         const sliceModel = await this.resolveBambuModel(args?.bambu_model);
                         const nozzleDiam = String(args?.nozzle_diameter || DEFAULT_NOZZLE_DIAMETER);
-                        const activeSlicerProfile = await resolveSlicerProfilePath(slicerProfile || undefined, resolveTemplatePathFromName(["json", "config", "3mf"]) || explicitTemplatePath || undefined, TEMP_DIR);
+                        // A Bambu project carries the designer's process settings. Without an
+                        // explicit profile or template, keep them instead of the default preset.
+                        const projectTemplate = !slicerProfile && !requestedTemplateName && !explicitTemplatePath &&
+                            /\.3mf$/i.test(String(args.stl_path)) && await hasBambuProjectSettings(String(args.stl_path))
+                            ? String(args.stl_path) : undefined;
+                        const activeSlicerProfile = await resolveSlicerProfilePath(slicerProfile || undefined, resolveTemplatePathFromName(["json", "config", "3mf"]) || explicitTemplatePath || projectTemplate || undefined, TEMP_DIR);
                         const explicitSlicerProfile = hasExplicitSlicerProfile(args);
                         // Resolve printer preset for BambuStudio slicer
                         const printerPreset = BAMBU_MODEL_PRESETS[sliceModel]?.(nozzleDiam);

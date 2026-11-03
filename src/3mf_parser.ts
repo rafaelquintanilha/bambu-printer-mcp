@@ -227,6 +227,15 @@ export async function parse3MF(filePath: string): Promise<ThreeMFData> {
     }
 }
 
+/** True when a 3MF is a Bambu/Orca project that carries its own slicer settings. */
+export async function hasBambuProjectSettings(filePath: string): Promise<boolean> {
+    try {
+        return (await JSZip.loadAsync(await fs.readFile(filePath))).file('Metadata/project_settings.config') !== null;
+    } catch {
+        return false;
+    }
+}
+
 export async function extractBambuTemplateSettings(
     filePath: string,
     outputDir: string

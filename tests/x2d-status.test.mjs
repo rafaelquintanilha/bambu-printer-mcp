@@ -27,6 +27,21 @@ test('compact status preserves job identity and errors without raw module/filame
   assert(JSON.stringify(result).length<1500);
 });
 
+test('a new job does not report the previous job layer as printing',()=>{
+  // Observed on the X2D one second after cloud dispatch: RUNNING with the new
+  // job, the earlier cube's layer 50, no stage entered and heaters still off.
+  const status=(stg_cur,progress,currentLayer)=>compactX2dStatus({connected:true,serial:'20PTEST',model:'X2D',status:'RUNNING',
+    observation:{receivedAt:start,requestedAt:start-1},print:{filename:'cable clips',progress,timeRemaining:0,currentLayer,totalLayers:87},
+    raw:{task_id:'new',stg_cur}},start);
+  const arrived=status(-1,0,50);
+  assert.equal(arrived.print.stage,'preparing');
+  assert.equal(arrived.print.currentLayer,null);
+  assert.equal(status(4,0,0).print.stage,'preparing');
+  const printing=status(0,51,3);
+  assert.equal(printing.print.stage,'printing');
+  assert.equal(printing.print.currentLayer,3);
+});
+
 test('unknown telemetry is not reported as fresh or error-free',()=>{
   const unknown=compactX2dStatus({status:'UNKNOWN',connected:true},start);
   assert.equal(unknown.observation.stale,true);

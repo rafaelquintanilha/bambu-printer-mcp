@@ -2229,6 +2229,14 @@ test("template machine settings never replace the selected machine preset", asyn
   fs.mkdirSync(templateDir, { recursive: true });
   const templatePath = path.join(templateDir, "x1c-project.3mf");
   fs.writeFileSync(templatePath, await zip.generateAsync({ type: "nodebuffer" }));
+  // The same project as a slicing input also declares its filament slots.
+  const project = new JSZip();
+  project.file("Metadata/project_settings.config", JSON.stringify({
+    ...JSON.parse(await zip.file("Metadata/project_settings.config").async("string")),
+    filament_settings_id: ["Behavior filament"], filament_type: ["PLA"], filament_colour: ["#FFFFFF"],
+  }));
+  const projectPath = path.join(templateDir, "x1c-project-input.3mf");
+  fs.writeFileSync(projectPath, await project.generateAsync({ type: "nodebuffer" }));
 
   const transport = new StdioClientTransport({
     command: process.execPath,
@@ -2255,6 +2263,9 @@ test("template machine settings never replace the selected machine preset", asyn
   for (const [name, template] of [
     ["slice_stl", { template_3mf_path: templatePath }],
     ["slice_with_template", { template_name: "x1c-project", template_dir: templateDir }],
+    // A Bambu project sliced without a template keeps its own process settings
+    // instead of falling back to the machine's default process preset.
+    ["slice_stl", { stl_path: projectPath }],
   ]) {
     const result = await client.callTool({
       name,
