@@ -42,6 +42,29 @@ test("version messages without OTA data preserve identity and do not terminate t
   assert.equal(printer.data.modules[0].name, "ams");
 });
 
+test('repeated version replies stay bounded without hiding conflicting module identities',async()=>{
+  const printer=client();
+  const store=new BambuImplementation().printerStore;
+  const key='127.0.0.1-239TEST-test';
+  printer.on('printer:dataUpdate',data=>store.updateReportSnapshot(key,data));
+  for(let i=0;i<40;i++) await report(printer,{info:{command:'get_version',module:[{name:'ota',sn:'239TEST',sw_ver:'1'}]}});
+  assert.equal(printer.data.modules.length,1);
+  await report(printer,{info:{command:'get_version',module:[{name:'ota',sn:'WRONG',sw_ver:'1'}]}});
+  assert.equal(printer.data.modules.length,2,'conflicting identity remains visible');
+});
+
+test('display freshness is based on received telemetry, not repeated cached reads or version replies',async()=>{
+  const store=new BambuImplementation().printerStore;
+  const key='127.0.0.1-239TEST-test';
+  store.updateReportSnapshot(key,{gcode_state:'RUNNING'},1234);
+  store.updateReportSnapshot(key,{modules:[{name:'ota'}]});
+  assert.equal(store.getReportReceivedAt('127.0.0.1','239TEST','test'),1234);
+  store.updateReportSnapshot(key,{layer_num:10},5678);
+  assert.equal(store.getReportReceivedAt('127.0.0.1','239TEST','test'),5678);
+  await store.disconnectAll();
+  assert.equal(store.getReportReceivedAt('127.0.0.1','239TEST','test'),null);
+});
+
 test("unexpected status transitions update status and accept the next report", async () => {
   const printer = client();
   for (const state of ["PAUSE", "FINISH", "IDLE", "FAILED", "PAUSE"]) {

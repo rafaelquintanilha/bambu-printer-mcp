@@ -1,6 +1,7 @@
 #include <dlfcn.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
@@ -9,7 +10,9 @@
 #include <functional>
 #include <iostream>
 #include <memory>
+#include <map>
 #include <mutex>
+#include <regex>
 #include <stdexcept>
 #include <sstream>
 #include <string>
@@ -19,6 +22,10 @@
 #include <unistd.h>
 #endif
 #include <thread>
+#include <vector>
+#if defined(__APPLE__)
+void configureCloudIdentity(const std::string &studioPath, const std::string &pluginPath);
+#endif
 
 // This small adapter intentionally mirrors the public C++ ABI declarations
 // used by Bambu Studio's optional networking plug-in.  The plug-in is loaded
@@ -164,6 +171,8 @@ std::string defaultConfigDir() {
 std::string defaultCertDir() {
     return envOr("BAMBU_NATIVE_CERT_DIR", "/Applications/BambuStudio.app/Contents/Resources/cert");
 }
+
+
 #else
 // Linux has no application bundle to borrow from. The setup script installs a
 // pinned plug-in and certificates under one private directory. The server
@@ -496,15 +505,19 @@ void requestPrinterState(NativeApi &api, void *agent, const std::string &serial)
 
 enum class NativeOperation {
     Print,
+    CloudPrint,
     Upload,
     Command,
     AuthorizedCommand,
 };
 
+void *createCloudAgent(const NativeApi &api);
+
 void runOperation(NativeApi &api, NativeOperation operation) {
+    const bool cloud = operation == NativeOperation::CloudPrint;
     const bool uploadOnly = operation == NativeOperation::Upload;
     const bool commandOnly = operation == NativeOperation::Command || operation == NativeOperation::AuthorizedCommand;
-    const bool needsAuthorization = operation == NativeOperation::Print || operation == NativeOperation::AuthorizedCommand;
+    const bool needsAuthorization = operation == NativeOperation::Print || cloud || operation == NativeOperation::AuthorizedCommand;
     const char *confirmation = commandOnly ? "BAMBU_NATIVE_COMMAND_CONFIRM" :
                                uploadOnly ? "BAMBU_NATIVE_UPLOAD_CONFIRM" : "BAMBU_NATIVE_CONFIRM";
     if (envOr(confirmation) != "1") {
@@ -536,7 +549,7 @@ void runOperation(NativeApi &api, NativeOperation operation) {
     const std::string certFile = envOr("BAMBU_NATIVE_CERT_FILE", "slicer_base64.cer");
     const std::string country = envOr("BAMBU_NATIVE_COUNTRY", "US");
 
-    void *agent = api.createAgent(configDir);
+    void *agent = cloud ? createCloudAgent(api) : api.createAgent(configDir);
     if (!agent) throw std::runtime_error("bambu_network_create_agent returned null");
     const auto destroyAgent = [&]() { api.destroyAgent(agent); };
 
@@ -554,7 +567,9 @@ void runOperation(NativeApi &api, NativeOperation operation) {
         }
     };
 
-    int result = api.setConfigDir(agent, configDir);
+    int result = 0;
+    if (!cloud) {
+    result = api.setConfigDir(agent, configDir);
     if (result != 0) { destroyAgent(); throw std::runtime_error("set_config_dir failed: " + std::to_string(result)); }
     result = api.initLog(agent);
     if (result != 0) { destroyAgent(); throw std::runtime_error("init_log failed: " + std::to_string(result)); }
@@ -711,6 +726,7 @@ void runOperation(NativeApi &api, NativeOperation operation) {
     }
 
     std::this_thread::sleep_for(std::chrono::seconds(3));
+    }
 
     BBL::PrintParams params;
     const std::string projectName = envOr("BAMBU_NATIVE_PROJECT_NAME", "native-mcp-job");
@@ -727,7 +743,7 @@ void runOperation(NativeApi &api, NativeOperation operation) {
     params.ams_mapping2 = envOr("BAMBU_NATIVE_AMS_MAPPING2");
     params.ams_mapping_info = envOr("BAMBU_NATIVE_AMS_MAPPING_INFO");
     params.nozzles_info = envOr("BAMBU_NATIVE_NOZZLES_INFO");
-    params.connection_type = "lan";
+    params.connection_type = cloud ? "cloud" : "lan";
     params.dev_ip = host;
     params.use_ssl_for_ftp = true;
     params.use_ssl_for_mqtt = true;
@@ -740,7 +756,7 @@ void runOperation(NativeApi &api, NativeOperation operation) {
     params.task_record_timelapse = boolEnv("BAMBU_NATIVE_TIMELAPSE", false);
     params.task_timelapse_use_internal = boolEnv("BAMBU_NATIVE_TIMELAPSE_INTERNAL", false);
     params.task_use_ams = boolEnv("BAMBU_NATIVE_USE_AMS", true);
-    params.task_bed_type = bedTypeForNative(envOr("BAMBU_NATIVE_BED_TYPE", "textured_plate"));
+    params.task_bed_type = cloud ? envOr("BAMBU_NATIVE_BED_TYPE", "textured_plate") : bedTypeForNative(envOr("BAMBU_NATIVE_BED_TYPE", "textured_plate"));
     params.auto_bed_leveling = intEnv("BAMBU_NATIVE_AUTO_BED_LEVELING", 0);
     params.auto_flow_cali = intEnv("BAMBU_NATIVE_AUTO_FLOW_CALI", 0);
     params.auto_offset_cali = intEnv("BAMBU_NATIVE_AUTO_OFFSET_CALI", 0);
@@ -749,16 +765,28 @@ void runOperation(NativeApi &api, NativeOperation operation) {
     params.try_emmc_print = boolEnv("BAMBU_NATIVE_TRY_EMMC_PRINT", true);
     params.print_type = envOr("BAMBU_NATIVE_PRINT_TYPE", "from_normal");
 
-    const BBL::OnUpdateStatusFn update = [](int status, int code, std::string message) {
+    bool cloudDispatchChecked = false;
+    const BBL::OnUpdateStatusFn update = [&](int status, int code, std::string message) {
+        // The cloud upload can outlive preflight. Recheck at the sending stage.
+        if (cloud && status == 3 && !cloudDispatchChecked) {
+            cloudDispatchChecked = true;
+            authorizeDispatch(2);
+        }
         outputLine("native_update status=" + std::to_string(status) + " code=" +
-                   std::to_string(code) + " msg=" + message);
+                   std::to_string(code) + (cloud ? "" : " msg=" + message));
     };
     const BBL::WasCancelledFn cancel = []() { return false; };
     const auto startAuthorizedPrint = [&](int attempt) {
         authorizeDispatch(attempt);
         return api.startLocalPrint(agent, params, update, cancel);
     };
-    if (uploadOnly) {
+    if (cloud) {
+        const auto startCloud = requiredSymbol<StartSendGcodeToSdcardFn>(api.handle, "bambu_network_start_print");
+        authorizeDispatch(1);
+        // The parent verifies physical start from fresh telemetry separately.
+        const std::function<bool(int, std::string)> wait = [](int, std::string) { return true; };
+        result = startCloud(agent, params, update, cancel, wait);
+    } else if (uploadOnly) {
         const std::function<bool(int, std::string)> wait = [](int, std::string) { return false; };
         result = api.startSendGcodeToSdcard(agent, params, update, cancel, wait);
     } else {
@@ -789,6 +817,108 @@ void runOperation(NativeApi &api, NativeOperation operation) {
 
 } // namespace
 
+// File service only: this library exposes the Studio storage tunnel and does
+// not load the networking agent or any print/control entry point.
+void runFileService() {
+    const std::string plugin = envOr("BAMBU_NATIVE_PLUGIN", defaultPluginPath());
+    const auto slash = plugin.find_last_of('/');
+#if defined(__APPLE__)
+    std::string source = plugin.substr(0, slash + 1) + "libBambuSource.dylib";
+    if (envOr("BAMBU_NATIVE_PLUGIN").empty() && !isRegularFile(source))
+        source = homeDir() + "/Library/Application Support/BambuStudio/plugins/libBambuSource.dylib";
+#else
+    const std::string source = plugin.substr(0, slash + 1) + "libBambuSource.so";
+#endif
+    void *library = dlopen(source.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (!library) throw std::runtime_error("could not load Bambu file-service library");
+    const auto symbol = [library](const char *name) {
+        void *value = dlsym(library, name);
+        if (!value) throw std::runtime_error(std::string("missing file-service symbol: ") + name);
+        return value;
+    };
+    struct Sample { int track; int size; int flags; void *buffer; uint64_t decodeTime; };
+    auto create = reinterpret_cast<int (*)(void **, const char *)>(symbol("Bambu_Create"));
+    auto open = reinterpret_cast<int (*)(void *)>(symbol("Bambu_Open"));
+    auto start = reinterpret_cast<int (*)(void *, int)>(symbol("Bambu_StartStreamEx"));
+    auto send = reinterpret_cast<int (*)(void *, int, const char *, int)>(symbol("Bambu_SendMessage"));
+    auto read = reinterpret_cast<int (*)(void *, Sample *)>(symbol("Bambu_ReadSample"));
+    auto close = reinterpret_cast<void (*)(void *)>(symbol("Bambu_Close"));
+    auto destroy = reinterpret_cast<void (*)(void *)>(symbol("Bambu_Destroy"));
+    const std::string host = envOr("BAMBU_NATIVE_HOST");
+    const std::string token = envOr("BAMBU_NATIVE_ACCESS_CODE");
+    if (host.empty() || token.empty() || host.find_first_of("/?&#\r\n") != std::string::npos ||
+        token.find_first_of("&?#\r\n") != std::string::npos)
+        throw std::runtime_error("invalid file-service host or access code");
+    void *handle = nullptr;
+    const auto check = [](int result, const char *stage) {
+        if (result != 0) throw std::runtime_error(std::string("file-service ") + stage + " failed: " + std::to_string(result));
+    };
+    const auto retry = [&check](auto operation, const char *stage) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        int result;
+        while ((result = operation()) == 2) {
+            if (std::chrono::steady_clock::now() >= deadline) throw std::runtime_error("file-service operation timed out");
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        check(result, stage);
+    };
+    const std::string url = "bambu:///local/" + host + "?port=6000&user=bblp&passwd=" + token;
+    check(create(&handle, url.c_str()), "create");
+    check(open(handle), "open");
+    constexpr int control = 0x3001;
+    constexpr size_t maxFrame = 4 * 1024 * 1024;
+    retry([&]() { return start(handle, control); }, "handshake");
+    std::atomic<bool> stopping{false};
+    std::thread reader([&]() {
+        try {
+            const char *digits = "0123456789abcdef";
+            while (!stopping) {
+                Sample sample{};
+                const int result = read(handle, &sample);
+                if (result == 2) { std::this_thread::sleep_for(std::chrono::milliseconds(10)); continue; }
+                check(result, "read");
+                if (sample.size < 0 || static_cast<size_t>(sample.size) > maxFrame || (!sample.buffer && sample.size))
+                    throw std::runtime_error("invalid file-service sample size");
+                const auto *bytes = static_cast<const unsigned char *>(sample.buffer);
+                std::string hex;
+                hex.reserve(sample.size * 2);
+                for (int i = 0; i < sample.size; ++i) { hex += digits[bytes[i] >> 4]; hex += digits[bytes[i] & 15]; }
+                outputLine("native_file_sample=" + hex);
+            }
+        } catch (const std::exception &error) {
+            std::cerr << "native_error=" << error.what() << std::endl;
+            exitNow(1);
+        }
+    });
+    outputLine("native_file_ready=1");
+    try {
+        std::string line;
+        while (std::getline(std::cin, line)) {
+            const std::string prefix = "native_file_send=";
+            if (line.compare(0, prefix.size(), prefix) != 0 || line.size() > prefix.size() + maxFrame * 2 ||
+                (line.size() - prefix.size()) % 2 != 0) throw std::runtime_error("invalid file-service frame");
+            const auto digit = [](char c) -> int {
+                if (c >= '0' && c <= '9') return c - '0';
+                if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+                throw std::runtime_error("invalid file-service hex");
+            };
+            std::string data;
+            for (size_t i = prefix.size(); i < line.size(); i += 2) data += static_cast<char>((digit(line[i]) << 4) | digit(line[i + 1]));
+            retry([&]() { return send(handle, control, data.data(), static_cast<int>(data.size())); }, "send");
+        }
+    } catch (...) {
+        // Avoid a joinable-thread destructor before main reports the error.
+        stopping = true;
+        reader.join();
+        throw;
+    }
+    stopping = true;
+    reader.join();
+    close(handle);
+    destroy(handle);
+    exitNow(0);
+}
+
 // Load the plug-in and resolve every required symbol without any network
 // access. On Linux also load the file-tunnel library the plug-in opens from its
 // own directory, so missing system libraries surface at setup time.
@@ -808,24 +938,143 @@ void runPluginCheck(const NativeApi &) {
     outputLine("plugin=ok");
 }
 
+// Read account/device access through the same cloud API used by Studio.
+// The caller supplies a private copy of its authenticated configuration; this
+// probe never uploads, dispatches a job, or changes the Studio session.
+namespace {
+void *createCloudAgent(const NativeApi &api) {
+    const auto loggedIn = requiredSymbol<bool (*)(void *)>(api.handle, "bambu_network_is_user_login");
+    const std::string directory = envOr("BAMBU_NATIVE_CONFIG_DIR");
+    const std::string serial = envOr("BAMBU_NATIVE_SERIAL");
+    if (directory.empty() || serial.empty()) throw std::runtime_error("cloud probe requires a private configuration directory and printer serial");
+    void *agent = api.createAgent(directory);
+    if (!agent) throw std::runtime_error("cloud agent creation failed");
+    const auto check = [](int result, const char *stage) {
+        if (result != 0) throw std::runtime_error(std::string("cloud ") + stage + " failed: " + std::to_string(result));
+    };
+    check(api.setConfigDir(agent, directory), "configuration");
+    check(api.setCertFile(agent, defaultCertDir(), envOr("BAMBU_NATIVE_CERT_FILE", "slicer_base64.cer")), "certificates");
+    check(api.setCountryCode(agent, envOr("BAMBU_NATIVE_COUNTRY", "US")), "region");
+    const auto headers = requiredSymbol<int (*)(void *, std::map<std::string, std::string>)>(api.handle, "bambu_network_set_extra_http_header");
+    std::ifstream bearerFile(directory + "/cloud-token");
+    std::string bearer; std::getline(bearerFile, bearer);
+    if (bearer.empty() || bearer.find_first_of("\r\n") != std::string::npos) throw std::runtime_error("cloud bearer session is missing");
+    const auto version = requiredSymbol<std::string (*)()>(api.handle, "bambu_network_get_version");
+    check(headers(agent, {{"Authorization", "Bearer " + bearer}, {"Accept", "application/json"},
+        {"User-Agent", "bambu_network_agent/" + version()}, {"X-BBL-Client-Type", "slicer"}, {"X-BBL-Client-Name", "BambuStudio"},
+        {"X-BBL-Client-Version", envOr("BAMBU_NATIVE_STUDIO_VERSION")}, {"X-BBL-OS-Type", "macos"},
+        {"X-BBL-Device-ID", envOr("BAMBU_NATIVE_STUDIO_DEVICE_ID")}, {"X-BBL-Language", "en"}}), "headers");
+    check(api.setQueueOnMain(agent, [](std::function<void()> callback) { if (callback) callback(); }), "callbacks");
+    auto capabilities = std::make_shared<LocalConnectionState>();
+    const auto send = requiredSymbol<SendMessageToPrinterFn>(api.handle, "bambu_network_send_message");
+    check(api.setPrinterConnected(agent, [agent, serial, send, &api](std::string devId) {
+        if (devId != serial) return;
+        const int result = send(agent, serial, R"({"pushing":{"sequence_id":"1","command":"pushall","version":1,"push_target":1}})", 0, 0);
+        outputLine("native_cloud_capability_request=" + std::to_string(result));
+        api.installDeviceCert(agent, serial, false);
+    }), "printer callback");
+    check(api.setMessage(agent, [capabilities, serial, agent, &api](std::string devId, std::string message) {
+        if ((devId.empty() || devId == serial) && message == "wait_info") api.installDeviceCert(agent, serial, false);
+        // The plug-in parses the device security flags from this same report.
+        // This is a readiness signal, not a replacement for the parent's
+        // independent fresh identity, hardware and job checks at dispatch.
+        static const std::regex flags(R"re("fun"\s*:\s*("[0-9a-fA-FxX]+"|[0-9]+)\s*[,}])re");
+        if (devId != serial || message.find("\"print\"") == std::string::npos || !std::regex_search(message, flags)) return;
+        std::lock_guard<std::mutex> lock(capabilities->mutex);
+        capabilities->resolved = true;
+        capabilities->cv.notify_all();
+    }), "device callback");
+    check(api.start(agent), "startup");
+    const bool authenticated = loggedIn(agent);
+    outputLine(std::string("native_cloud_session=") + (authenticated ? "present" : "missing"));
+    if (!authenticated) exitNow(1);
+    check(api.updateCert(agent), "app certificate update");
+    const auto connectServer = requiredSymbol<int (*)(void *)>(api.handle, "bambu_network_connect_server");
+    const auto serverCallback = requiredSymbol<int (*)(void *, std::function<void(int, int)>)>(api.handle, "bambu_network_set_on_server_connected_fn");
+    auto connection = std::make_shared<LocalConnectionState>();
+    check(serverCallback(agent, [connection](int code, int reason) {
+        outputLine("native_cloud_server code=" + std::to_string(code) + " reason=" + std::to_string(reason));
+        std::lock_guard<std::mutex> lock(connection->mutex); connection->resolved = true; connection->ok = code == 0 && reason == 0; connection->cv.notify_all();
+    }), "server callback");
+    check(connectServer(agent), "connect");
+    { std::unique_lock<std::mutex> lock(connection->mutex);
+      if (!connection->cv.wait_for(lock, std::chrono::seconds(15), [&]() { return connection->resolved; }) || !connection->ok)
+          throw std::runtime_error("cloud connection failed before dispatch; no job was submitted"); }
+    const auto select = requiredSymbol<int (*)(void *, std::string)>(api.handle, "bambu_network_set_user_selected_machine");
+    const auto subscribe = requiredSymbol<int (*)(void *, std::vector<std::string>)>(api.handle, "bambu_network_add_subscribe");
+    const auto startSubscription = requiredSymbol<int (*)(void *, std::string)>(api.handle, "bambu_network_start_subscribe");
+    check(select(agent, serial), "select printer");
+    check(subscribe(agent, {serial}), "subscribe printer");
+    check(startSubscription(agent, "app"), "start subscription");
+    { std::unique_lock<std::mutex> lock(capabilities->mutex);
+      if (!capabilities->cv.wait_for(lock, std::chrono::seconds(15), [&]() { return capabilities->resolved; })) {
+          outputLine("native_cloud_device=timeout");
+          throw std::runtime_error("cloud printer capability report timed out before dispatch; no job was submitted"); } }
+    outputLine("native_cloud_device=ready");
+    return agent;
+}
+} // namespace
+
+void runCloudProbe(const NativeApi &api) {
+    void *agent = createCloudAgent(api);
+    const auto getDevices = requiredSymbol<int (*)(void *, unsigned int *, std::string *)>(api.handle, "bambu_network_get_user_print_info");
+    unsigned int http = 0;
+    std::string body;
+    const int result = getDevices(agent, &http, &body);
+    // Private probe output is consumed locally, never forwarded as a tool log.
+    const std::string responsePath = envOr("BAMBU_NATIVE_CONFIG_DIR") + "/cloud-probe-response.json";
+    { std::ofstream response(responsePath); response << body; }
+    chmod(responsePath.c_str(), 0600);
+    outputLine("native_cloud_query result=" + std::to_string(result) + " http=" + std::to_string(http));
+    if (result != 0 || http != 200) exitNow(1);
+    // Account lookup does not exercise the app-signing gate. Minting a camera
+    // URL does, without uploading a model or submitting a print. Never emit the
+    // URL: it contains credentials. An error string is not a successful URL.
+    const auto getCamera = requiredSymbol<int (*)(void *, std::string, std::function<void(std::string)>)>(api.handle, "bambu_network_get_camera_url");
+    auto signing = std::make_shared<LocalConnectionState>();
+    const int cameraResult = getCamera(agent, envOr("BAMBU_NATIVE_SERIAL"), [signing](std::string url) {
+        std::lock_guard<std::mutex> lock(signing->mutex);
+        signing->ok = url.rfind("bambu:///", 0) == 0;
+        signing->resolved = true;
+        signing->cv.notify_all();
+    });
+    std::unique_lock<std::mutex> lock(signing->mutex);
+    if (cameraResult != 0 || !signing->cv.wait_for(lock, std::chrono::seconds(10), [&]() { return signing->resolved; }) || !signing->ok) {
+        outputLine("native_cloud_signing=rejected");
+        exitNow(1);
+    }
+    outputLine("native_cloud_signing=verified");
+    exitNow(0);
+}
+
 int main(int argc, char **argv) {
     try {
+        if (argc == 2 && std::strcmp(argv[1], "--file-service") == 0) runFileService();
         const bool pluginCheck = argc == 2 && std::strcmp(argv[1], "--check-plugin") == 0;
         const bool probe = argc == 2 && std::strcmp(argv[1], "--probe") == 0;
         const bool mqttProbe = argc == 2 && std::strcmp(argv[1], "--probe-mqtt") == 0;
+        const bool cloudProbe = argc == 2 && std::strcmp(argv[1], "--probe-cloud") == 0;
         const bool print = argc == 2 && std::strcmp(argv[1], "--print-authorized") == 0;
+        const bool cloudPrint = argc == 2 && std::strcmp(argv[1], "--cloud-print-authorized") == 0;
         const bool upload = argc == 2 && std::strcmp(argv[1], "--upload") == 0;
         const bool command = argc == 2 && std::strcmp(argv[1], "--command") == 0;
         const bool authorizedCommand = argc == 2 && std::strcmp(argv[1], "--command-authorized") == 0;
-        if (!pluginCheck && !probe && !mqttProbe && !print && !upload && !command && !authorizedCommand) {
+        if (!pluginCheck && !probe && !mqttProbe && !cloudProbe && !print && !cloudPrint && !upload && !command && !authorizedCommand) {
             std::cerr << "usage: bambu-native-print --check-plugin|--probe|--probe-mqtt|--print-authorized|--upload|--command|--command-authorized" << std::endl;
             return 2;
         }
+#if defined(__APPLE__)
+        if (cloudProbe || cloudPrint) configureCloudIdentity(
+            envOr("SLICER_PATH", "/Applications/BambuStudio.app/Contents/MacOS/BambuStudio"),
+            envOr("BAMBU_NATIVE_PLUGIN", defaultPluginPath()));
+#endif
         NativeApi api = loadApi();
         if (pluginCheck) runPluginCheck(api);
         if (probe) runProbe(api);
         if (mqttProbe) runMqttProbe(api);
+        if (cloudProbe) runCloudProbe(api);
         if (print) runOperation(api, NativeOperation::Print);
+        if (cloudPrint) runOperation(api, NativeOperation::CloudPrint);
         if (upload) runOperation(api, NativeOperation::Upload);
         if (command) runOperation(api, NativeOperation::Command);
         if (authorizedCommand) runOperation(api, NativeOperation::AuthorizedCommand);

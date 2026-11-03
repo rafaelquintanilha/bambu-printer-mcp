@@ -18,6 +18,7 @@ import os from "node:os";
 import path from "path";
 import { createServer as createHttpServer, type IncomingMessage, type Server as HttpServer, type ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
+import { fileURLToPath } from "node:url";
 import {
   STLManipulator,
   SLICER_TYPES,
@@ -36,9 +37,9 @@ import {
   buildBambuNativeTemperatureCommand,
   printWithBambuNative,
   sendCommandWithBambuNative,
-  uploadWithBambuNative,
   type BambuNativeUpdateCallback,
 } from "./bambu-native.js";
+import { BambuFileServiceError, listInternalPrinterFiles, uploadInternalPrinterFile } from "./bambu-file-service.js";
 import { importFileViaBambuConnect } from "./bambu-connect.js";
 import { BlenderMcpBridge } from "./blender-mcp-bridge.js";
 import { bridgeAmsMapping2Entry, bridgeAmsMappingValue, externalTrayForNozzle, hasAmsMappingInput, normalizeAmsMappingObject, normalizeBridgeAmsTrayValue } from "./ams-mapping.js";
@@ -46,11 +47,16 @@ import { analyze3MFAmsRequirements, analyze3MFPlateObjects, analyzeCollarCharm3M
 import type { ThreeMFAmsRequirements } from "./types.js";
 import { BambuImplementation, assertDirectPrintSupported } from "./printers/bambu.js";
 import { inspectPrintFile } from "./safety/print-file.js";
-import { externalStorageState, validatePrinterState } from "./safety/printer-state.js";
+import { externalStorageState, unchippedNozzles, validatePrinterState } from "./safety/printer-state.js";
 import { isDualNozzleModel } from "./safety/limits.js";
 import { withPrinterOperation, withPrintSnapshot, uniquePrintName } from "./safety/artifact.js";
 import { detectProfilesRoot } from "./slicer/profile-flatten.js";
 import { configureX2dEnvironment, describeX2dResult, X2dToolProfile } from "./x2d-profile.js";
+import { X2dPrintReviews, printReviewState, printReviewDetails, type ApprovedPrint } from "./x2d-print-review.js";
+import { compactX2dStatus, connectorBuildId, X2dJobHistory } from "./x2d-status.js";
+import { PrintLibrary } from "./print-library.js";
+import { cloudPrintMetadata } from "./bambu-cloud.js";
+import { probeBambuCloud } from "./bambu-native.js";
 
 dotenv.config();
 const X2D_PROFILE = process.env.MCP_PROFILE === "x2d";
@@ -895,6 +901,7 @@ type StructuredToolError = {
   suggestion: string;
   message: string;
   tool: string;
+  file_transfer?: ReturnType<BambuFileServiceError["details"]>;
 };
 
 type UploadGcodeSource = {
@@ -1208,13 +1215,21 @@ class BambuPrinterMCPServer {
   private httpRuntime?: { transport: StreamableHTTPServerTransport; httpServer: HttpServer };
   private shuttingDown = false;
   private readonly confirmationTimeoutMs = parseConfirmationTimeout(process.env.BAMBU_CONFIRMATION_TIMEOUT_MS);
+  private readonly printReviews = new X2dPrintReviews();
+  private readonly startedAt = new Date().toISOString();
+  private readonly packageVersion = JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
+  private readonly distributionDirectory = fileURLToPath(new URL(".", import.meta.url));
+  private readonly buildId = X2D_PROFILE ? connectorBuildId(this.distributionDirectory) : undefined;
+  private readonly stateDirectory = process.env.BAMBU_STATE_DIR || path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state"), "bambu-x2d");
+  private jobHistory?: X2dJobHistory;
+  private printLibrary?: PrintLibrary;
 
   constructor() {
     this.runtimeConfig = readRuntimeConfig();
     this.server = new Server(
       {
         name: X2D_PROFILE ? "bambu-x2d-mcp" : "bambu-printer-mcp",
-        version: JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8")).version
+        version: this.packageVersion
       },
       {
         capabilities: {
@@ -1265,6 +1280,25 @@ class BambuPrinterMCPServer {
   setupHandlers() {
     this.setupResourceHandlers();
     this.setupToolHandlers();
+  }
+
+  private history(): X2dJobHistory {
+    return this.jobHistory ??= new X2dJobHistory(this.stateDirectory);
+  }
+
+  private library(): PrintLibrary {
+    const roots = process.env.BAMBU_LIBRARY_DIRS === undefined ? [TEMP_DIR] : process.env.BAMBU_LIBRARY_DIRS.split(path.delimiter).filter(Boolean).map(root => path.resolve(root));
+    return this.printLibrary ??= new PrintLibrary(this.stateDirectory, roots);
+  }
+
+  private async displayStatus(host: string, serial: string, token: string, includeRaw = false) {
+    const status = await this.bambu.getStatus(host, serial, token);
+    if (!X2D_PROFILE) return status;
+    const summary = compactX2dStatus(status);
+    let tracking;
+    try { tracking = this.history().observe(summary); }
+    catch (error) { tracking = { recorded: false, error: `Unable to save job history: ${(error as Error).message}` }; }
+    return { ...summary, tracking, ...(includeRaw ? { raw: status.raw ?? null } : {}) };
   }
 
   /**
@@ -1543,7 +1577,7 @@ class BambuPrinterMCPServer {
     host: string,
     bambuSerial: string,
     bambuToken: string,
-    native?: { onUpdate?: BambuNativeUpdateCallback; signal?: AbortSignal }
+    native?: { onUpdate?: BambuNativeUpdateCallback; signal?: AbortSignal; review?: "prepare" | ApprovedPrint }
   ): Promise<Record<string, unknown>> {
     if (!args?.three_mf_path) {
       throw new Error("Missing required parameter: three_mf_path");
@@ -1642,10 +1676,52 @@ class BambuPrinterMCPServer {
       }
       const requirements = { ...inspection, amsMapping: mapping, useAMS };
       const initialStatus = await this.bambu.getSafetyStatus(devIp, devId, password || bambuToken);
-      validatePrinterState(initialStatus, requirements);
-      const bedClearance = await this.bambu.confirmPrintPreflight(devId, initialStatus, inspection);
+      const checked = validatePrinterState(initialStatus, requirements);
+      if (native?.review === "prepare") {
+        if (!X2D_PROFILE) throw new Error("Chat print reviews are restricted to the dedicated X2D profile.");
+        const state = printReviewState(initialStatus, checked, requirements);
+        const { preflight } = this.bambu.describePrintPreflight(devId, initialStatus, inspection);
+        const details = await printReviewDetails(snapshot, plateIndex);
+        const externalStorage = nativeExternalStorage(args?.try_emmc_print, initialStatus.raw);
+        if (externalStorage && externalStorageState(initialStatus.raw) !== "normal") {
+          throw new Error("External storage was requested, but the printer reports no ready SD card or USB stick.");
+        }
+        const review = this.printReviews.prepare({ host: devIp, serial: devId, inspection, state, preflight,
+          // Freeze the resolved file, mapping and storage choice. Confirmation accepts no print overrides.
+          args: { ...args, three_mf_path: threeMFPath, ams_slots: undefined, auto_match_ams: false,
+            ams_mapping: mapping, use_ams: useAMS, try_emmc_print: !externalStorage },
+        });
+        const camera = await this.reviewCamera(devIp, devId, password || bambuToken);
+        const afterCamera = await this.bambu.getSafetyStatus(devIp, devId, password || bambuToken);
+        const checkedAfterCamera = validatePrinterState(afterCamera, requirements);
+        if (JSON.stringify(state) !== JSON.stringify(printReviewState(afterCamera, checkedAfterCamera, requirements))) {
+          throw new Error("Printer setup changed while preparing the review. Prepare it again; no command was sent.");
+        }
+        this.bambu.assertBedClearance(afterCamera, preflight);
+        if (native.signal?.aborted) throw new Error("Print preparation was cancelled; no command was sent.");
+        assertActive();
+        return { status: "awaiting_confirmation", printRequested: false, approval_id: review.id,
+          expires_at: new Date(review.expiresAt).toISOString(),
+          summary: { file: threeMfFilename, plate_number: plateIndex + 1, ...details,
+            filaments: state.filaments.map(filament => ({ position: filament.filamentPosition, ams_slot: filament.slot,
+              material: filament.material, color: filament.color })),
+            nozzles: checked.reportedNozzles, bed_type: printBedType,
+            peak_temperatures: { nozzle: inspection.maxNozzleTemperature, bed: inspection.maxBedTemperature, chamber: inspection.maxChamberTemperature },
+            bed_leveling: args.bed_leveling ?? true, flow_calibration: args.flow_calibration ?? true,
+            vibration_calibration: args.vibration_calibration ?? true, timelapse: args.timelapse ?? false,
+            storage: externalStorage ? "external" : "internal", sha256: inspection.sha256,
+            previous_job: initialStatus.raw.subtask_name ?? null, notices: preflight.notices,
+            configured_only_nozzles: unchippedNozzles(initialStatus.raw),
+          }, camera,
+          next_step: "Show the user this model, quantity and selected colors and obtain explicit approval. Inspect the camera image for a clear plate; ask the user if the view is obstructed or uncertain. Call confirm_print with this approval_id, the user's actual affirmative reply, and the inspected capture_id. If the camera is over two minutes old, take and inspect a new camera_snapshot first. No command has been sent.",
+        };
+      }
+      const approval = native?.review;
+      if (approval) this.printReviews.assertMatches(approval, devIp, devId, inspection, printReviewState(initialStatus, checked, requirements));
+      const bedClearance = approval ? approval.review.preflight : await this.bambu.confirmPrintPreflight(devId, initialStatus, inspection);
       const confirmedStatus = await this.bambu.getSafetyStatus(devIp, devId, password || bambuToken);
-      validatePrinterState(confirmedStatus, requirements);
+      const confirmedCheck = validatePrinterState(confirmedStatus, requirements);
+      if (approval) this.printReviews.assertMatches(approval, devIp, devId, inspection, printReviewState(confirmedStatus, confirmedCheck, requirements));
       this.bambu.assertBedClearance(confirmedStatus, bedClearance);
       const amsMapping = stringifyBridgeJson(mapping?.map(value => bridgeAmsMappingValue(value, isDualNozzleModel(printModel))));
       const remoteFileName = uniquePrintName(threeMFPath);
@@ -1721,10 +1797,12 @@ class BambuPrinterMCPServer {
           layerInspect: params.task_layer_inspect as boolean,
           timelapse: params.task_record_timelapse as boolean,
           externalStorage,
+          ...(process.env.BAMBU_NATIVE_PRINT_ROUTE === "cloud" ? await cloudPrintMetadata(snapshot, inspection, printReviewState(confirmedStatus, confirmedCheck, requirements)) : {}),
         }, native.onUpdate, { signal: native.signal, assertActive, beforeDispatch: async () => {
           assertActive();
           const dispatchStatus = await this.bambu.getSafetyStatus(devIp, devId, password || bambuToken);
-          validatePrinterState(dispatchStatus, requirements);
+          const dispatchCheck = validatePrinterState(dispatchStatus, requirements);
+          if (approval) this.printReviews.assertMatches(approval, devIp, devId, inspection, printReviewState(dispatchStatus, dispatchCheck, requirements));
           this.bambu.assertBedClearance(dispatchStatus, bedClearance);
           if (externalStorage && externalStorageState(dispatchStatus.raw) !== "normal") {
             throw new Error("The printer's SD card or USB stick is no longer ready. Check it and start the print again.");
@@ -1843,15 +1921,23 @@ class BambuPrinterMCPServer {
 
   private async print3mfViaBambuNative(
     args: Record<string, any>, host: string, bambuSerial: string, bambuToken: string,
-    onUpdate?: BambuNativeUpdateCallback, signal?: AbortSignal
+    onUpdate?: BambuNativeUpdateCallback, signal?: AbortSignal, review?: "prepare" | ApprovedPrint
   ): Promise<Record<string, unknown>> {
     assertBambuNativeAvailable();
     const model = await this.resolveBambuModel(args.bambu_model);
     if (model !== "x2d") throw new Error("connection_mode=bambu_native is restricted to X2D.");
     return this.print3mfViaBambuNetwork(
       { ...args, bambu_model: model, connection_type: "lan", bambu_network_method: "start_local_print" },
-      host, bambuSerial, bambuToken, { onUpdate, signal }
+      host, bambuSerial, bambuToken, { onUpdate, signal, review }
     );
+  }
+
+  private async reviewCamera(host: string, serial: string, token: string) {
+    const camera = await this.bambu.cameraSnapshot(host, serial, token, {
+      bambuModel: "x2d", timeoutMs: 15_000, ffmpegPath: this.runtimeConfig.ffmpegPath,
+    });
+    const evidence = this.printReviews.recordCamera(host, serial);
+    return { ...camera, capture_id: evidence.id, captured_at: new Date(evidence.capturedAt).toISOString() };
   }
 
   private async uploadFileViaBambuNative(
@@ -1886,13 +1972,16 @@ class BambuPrinterMCPServer {
           await inspectPrintFile(snapshot, { model, plateIndex, bedType });
         }
         assertActive();
-        await this.bambu.disconnectAll();
-        await uploadWithBambuNative({
-          host, serial: bambuSerial, token: bambuToken, filePath: snapshot,
-          remoteName: destination, projectName: args.project_name ?? path.posix.basename(String(args.filename)),
-          presetName: args.preset_name ?? "checked-upload", plateIndex, bedType, useAMS: false,
-        }, onUpdate, { signal, assertActive });
+        return uploadInternalPrinterFile({ host, token: bambuToken, filePath: snapshot, remoteName: destination }, onUpdate, { signal, assertActive });
       });
+  }
+
+  private async listPrinterFiles(host: string, serial: string, token: string, signal?: AbortSignal) {
+    const x2d = X2D_PROFILE || serial.trim().toUpperCase().startsWith("20P") ||
+      (DEFAULT_BAMBU_MODEL === "x2d" && serial === DEFAULT_BAMBU_SERIAL);
+    return x2d
+      ? listInternalPrinterFiles({ host, token }, { signal })
+      : this.bambu.getFiles(host, serial, token);
   }
 
   private async getResolvedPrinterFilamentInventory(
@@ -2202,9 +2291,9 @@ class BambuPrinterMCPServer {
       let content;
 
       if (resource === "status") {
-        content = await this.bambu.getStatus(host || DEFAULT_HOST, bambuSerial, bambuToken);
+        content = await this.displayStatus(host || DEFAULT_HOST, bambuSerial, bambuToken);
       } else if (resource === "files") {
-        content = await this.bambu.getFiles(host || DEFAULT_HOST, bambuSerial, bambuToken);
+        content = await this.listPrinterFiles(host || DEFAULT_HOST, bambuSerial, bambuToken);
       } else if (resource === "hms") {
         const status = await this.bambu.getStatus(host || DEFAULT_HOST, bambuSerial, bambuToken);
         let diagnostics = extractPrinterDiagnostics(status);
@@ -3238,20 +3327,19 @@ class BambuPrinterMCPServer {
       const reportNativeUpdate: BambuNativeUpdateCallback | undefined = progressToken === undefined
         ? undefined
         : (line) => {
-            const match = /^native_update status=(-?\d+) code=(-?\d+) msg=(.*)$/.exec(line);
-            if (!match) return;
+            const match = /^native_update status=(-?\d+) code=(-?\d+)(?: msg=(.*))?$/.exec(line);
+            const fileStage = /^internal_upload stage=(sending|readback)$/.exec(line);
+            if (!match && !fileStage) return;
 
-            const stage = Number(match[1]);
-            const code = Number(match[2]);
-            const message = match[3];
+            const code = match ? Number(match[2]) : fileStage![1] === "sending" ? 0 : 1;
             progressNotifications = progressNotifications
               .then(() => extra.sendNotification({
                 method: "notifications/progress",
                 params: {
                   progressToken,
                   progress: code,
-                  total: 100,
-                  message: `native_update status=${stage} code=${code} msg=${message}`,
+                  total: match ? 100 : 2,
+                  message: line,
                 },
               }))
               .catch(() => {});
@@ -3317,6 +3405,9 @@ class BambuPrinterMCPServer {
 
       try {
         let result;
+        if (X2D_PROFILE && ["confirm_print", "upload_file"].includes(name) && connectorBuildId(this.distributionDirectory) !== this.buildId) {
+          throw new Error("This connector process has an older build than the installed files. Open a fresh connector session before sending; no upload or print command was sent.");
+        }
 
         switch (name) {
           case "inspect_print_file": {
@@ -3348,8 +3439,51 @@ class BambuPrinterMCPServer {
             break;
           }
           case "get_printer_status":
-            result = await this.bambu.getStatus(host, bambuSerial, bambuToken);
+            result = await this.displayStatus(host, bambuSerial, bambuToken, args?.include_raw === true);
             break;
+
+          case "get_print_history":
+            if (!X2D_PROFILE) throw new McpError(ErrorCode.MethodNotFound, "Job history is available in the dedicated X2D profile.");
+            result = this.history().list(bambuSerial, args?.limit === undefined ? 10 : Number(args.limit));
+            break;
+
+          case "save_makerworld_collection":
+            if (!X2D_PROFILE) throw new McpError(ErrorCode.MethodNotFound, "Saved collections are available in the X2D profile.");
+            result = this.library().saveCollection(args as any);
+            break;
+
+          case "find_saved_prints":
+            if (!X2D_PROFILE) throw new McpError(ErrorCode.MethodNotFound, "Saved prints are available in the X2D profile.");
+            result = await this.library().find(String(args?.query ?? ""), Number(args?.limit ?? 10), extra.signal);
+            break;
+
+          case "get_saved_print_details": {
+            if (!X2D_PROFILE) throw new McpError(ErrorCode.MethodNotFound, "Saved prints are available in the X2D profile.");
+            const files = args?.check_printer_storage === true ? (await listInternalPrinterFiles({ host, token: bambuToken }, { signal: extra.signal })).entries : undefined;
+            result = await this.library().details(String(args!.file_path), files, args?.include_preview !== false);
+            break;
+          }
+
+          case "get_connector_info": {
+            if (!profile) throw new McpError(ErrorCode.MethodNotFound, "Connector diagnostics are available in the dedicated X2D profile.");
+            const diskBuildId = connectorBuildId(this.distributionDirectory);
+            const diskVersion = JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
+            const unavailable = bambuNativeUnavailableReason();
+            result = {
+              name: "bambu-x2d-mcp", version: this.packageVersion, build_id: this.buildId,
+              started_at: this.startedAt, disk_build_id: diskBuildId, disk_version: diskVersion,
+              restart_required: diskBuildId !== this.buildId || diskVersion !== this.packageVersion,
+              runtime: { node: process.version, platform: process.platform, architecture: process.arch },
+              tool_names: profile.tools.map(tool => tool.name),
+              features: { compact_status: true, camera_image_content: true, chat_print_review: true, persistent_job_history: true, internal_file_listing: true, upload_readback_verification: true, saved_print_library: true },
+              native_transport: { local_prerequisites_available: unavailable === undefined, reason: unavailable ?? null, signing: "not_checked", physical_print: "not_checked" },
+              print_route: process.env.BAMBU_NATIVE_PRINT_ROUTE || "local",
+              cloud_transport: args?.check_connections === true ? await probeBambuCloud(bambuSerial, extra.signal).catch(error => ({ status: "unavailable", message: error.message })) : { configured: !!process.env.BAMBU_CLOUD_STUDIO_DIR, authentication: "not_checked", submission: "not_checked" },
+              local_storage: args?.check_connections === true ? await listInternalPrinterFiles({ host, token: bambuToken }, { signal: extra.signal }).then(files => ({ status: "available", file_count: files.entries.length, checked_at: new Date().toISOString() })).catch(error => ({ status: "unavailable", message: error.message, ...(error instanceof BambuFileServiceError ? error.details() : {}) })) : { status: "not_checked" },
+              job_history: { directory: this.stateDirectory, retained_jobs_per_printer: 100, refresh: "get_printer_status or status resource; no background scheduler" },
+            };
+            break;
+          }
 
           case "get_printer_filaments": {
             const requestedModel = (String(args?.bambu_model ?? DEFAULT_BAMBU_MODEL ?? "")).trim().toLowerCase();
@@ -3421,7 +3555,7 @@ class BambuPrinterMCPServer {
             break;
 
           case "list_printer_files":
-            result = await this.bambu.getFiles(host, bambuSerial, bambuToken);
+            result = await this.listPrinterFiles(host, bambuSerial, bambuToken, extra.signal);
             break;
 
           case "bambu_connect_import_file":
@@ -3491,6 +3625,10 @@ class BambuPrinterMCPServer {
                 "ffmpeg_path"
               ) ?? this.runtimeConfig.ffmpegPath,
             });
+            if (X2D_PROFILE) {
+              const evidence = this.printReviews.recordCamera(host, bambuSerial);
+              result = { ...result, capture_id: evidence.id, captured_at: new Date(evidence.capturedAt).toISOString() };
+            }
             break;
           }
 
@@ -3559,6 +3697,7 @@ class BambuPrinterMCPServer {
           }
 
           case "cancel_print":
+            this.printReviews.invalidate();
             result = await this.bambu.cancelJob(host, bambuSerial, bambuToken,
               nativeControls()
                 ? linuxEmergency(
@@ -3710,6 +3849,7 @@ class BambuPrinterMCPServer {
             if (typeof args.temperature !== "number" || !Number.isFinite(args.temperature) || args.temperature < 0) {
               throw new Error("Temperature must be a finite, non-negative number in °C.");
             }
+            if (args.temperature === 0) this.printReviews.invalidate();
             const heaterModel = args.temperature === 0
               ? String(args.bambu_model || DEFAULT_BAMBU_MODEL).trim().toLowerCase()
               : await this.resolveBambuModel(args.bambu_model as string | undefined);
@@ -4104,7 +4244,20 @@ class BambuPrinterMCPServer {
             break;
           }
 
+          case "confirm_print": {
+            if (!X2D_PROFILE) throw new Error("Chat print reviews are restricted to the dedicated X2D profile.");
+            const approved = this.printReviews.consume(args!);
+            result = await this.print3mfViaBambuNative(
+              approved.review.args, host, bambuSerial, bambuToken, reportNativeUpdate, extra.signal, approved
+            );
+            result = { ...result, approval_id: approved.review.id, approval_source: "chat", camera_capture_id: approved.camera.id };
+            break;
+          }
+
+          case "prepare_print":
           case "print_3mf": {
+            if (name === "prepare_print" && !X2D_PROFILE) throw new Error("Chat print reviews are restricted to the dedicated X2D profile.");
+            if (X2D_PROFILE) this.printReviews.invalidate();
             if (!args?.three_mf_path) {
               throw new Error("Missing required parameter: three_mf_path");
             }
@@ -4134,7 +4287,7 @@ class BambuPrinterMCPServer {
             }
             if (effectiveConnectionMode === "bambu_native") {
               result = await this.print3mfViaBambuNative(
-                resolvedArgs, host, bambuSerial, bambuToken, reportNativeUpdate, extra.signal
+                resolvedArgs, host, bambuSerial, bambuToken, reportNativeUpdate, extra.signal, X2D_PROFILE ? "prepare" : undefined
               );
               break;
             }
@@ -4459,6 +4612,17 @@ class BambuPrinterMCPServer {
 
         await progressNotifications;
         if (X2D_PROFILE) result = describeX2dResult(name, result);
+        // Deliver the frame as an actual MCP image, without duplicating base64 in text/JSON.
+        if (X2D_PROFILE && result && typeof result === "object") {
+          const payload = result as Record<string, any>;
+          const camera = name === "camera_snapshot" ? payload : name === "get_saved_print_details" ? payload.preview : payload.camera;
+          if (["image/jpeg", "image/png"].includes(camera?.format) && typeof camera.base64 === "string") {
+            const { base64, ...metadata } = camera;
+            const data = name === "camera_snapshot" ? metadata : name === "get_saved_print_details" ? { ...payload, preview: metadata } : { ...payload, camera: metadata };
+            return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }, { type: "image", mimeType: camera.format, data: base64 }],
+              ...(this.runtimeConfig.enableJsonResponse ? { structuredContent: data } : {}) };
+          }
+        }
         const text = typeof result === "string" ? result : JSON.stringify(result, null, 2);
 
         if (this.runtimeConfig.enableJsonResponse && typeof result === "object") {
@@ -4471,17 +4635,23 @@ class BambuPrinterMCPServer {
         return { content: [{ type: "text", text }] };
 
       } catch (error) {
+        if (X2D_PROFILE && (name === "prepare_print" || name === "print_3mf")) this.printReviews.invalidate();
         const message = error instanceof Error ? error.message : String(error);
         // Refusals and printer rejections repeat unchanged; say what to fix instead of "try again".
         const refused = /nothing was (?:sent|uploaded)|no command was sent|does not match the job|is ambiguous|is missing or ambiguous|rejected the print command|are refused|is refused|refused because|refused until|refused before/i.test(message);
         const structured: StructuredToolError = {
           status: "error",
           retryable: false,
-          suggestion: refused
+          suggestion: error instanceof BambuFileServiceError ? error.recovery
+            : /older build than the installed files/.test(message) ? "Open a fresh configured connector session and check get_connector_info before sending. Do not retry through this stale process or re-slice the file."
+            : /SIGNED_ERROR \(-26\)|native print dispatch is uncertain|Bambu cloud|File-service/i.test(message)
+            ? message
+            : refused
             ? `Retrying unchanged repeats this refusal. Fix the reported cause (file, arguments, printer settings, or printer state) first. Error: ${message}`
             : `Check parameters and try again. Error: ${message}`,
           message,
           tool: name,
+          ...(error instanceof BambuFileServiceError ? { file_transfer: error.details() } : {}),
         };
 
         return {
@@ -4507,6 +4677,8 @@ class BambuPrinterMCPServer {
       // Closing the MCP transport aborts its active requests before exit cleanup.
       await this.server.close();
       this.httpRuntime?.httpServer.close();
+      this.jobHistory?.close();
+      this.printLibrary?.close();
     } catch (error) {
       console.error("[MCP Shutdown]", error);
     } finally {

@@ -234,6 +234,7 @@ class BambuClientStore {
         this.printers = new Map();
         this.initialConnectionPromises = new Map();
         this.reportSnapshots = new Map();
+        this.reportReceivedAt = new Map();
         this.initialReportPromises = new Map();
         this.initialReportResolvers = new Map();
     }
@@ -256,10 +257,17 @@ class BambuClientStore {
         this.initialReportResolvers.delete(key);
         resolve();
     }
-    updateReportSnapshot(key, update) {
+    updateReportSnapshot(key, update, receivedAt) {
         if (!update || Object.keys(update).length === 0) {
             return;
         }
+        // bambu-node deduplicates module objects by reference, so identical version
+        // replies accumulate. Remove exact repeats while retaining conflicting identities.
+        if (Array.isArray(update.modules)) {
+            update.modules = [...new Map(update.modules.map(module => [JSON.stringify(module), module])).values()];
+        }
+        if (receivedAt !== undefined)
+            this.reportReceivedAt.set(key, receivedAt);
         const previous = this.reportSnapshots.get(key) || {};
         this.reportSnapshots.set(key, { ...previous, ...update });
         this.resolveInitialReport(key);
@@ -268,11 +276,15 @@ class BambuClientStore {
         this.printers.delete(key);
         this.initialConnectionPromises.delete(key);
         this.reportSnapshots.delete(key);
+        this.reportReceivedAt.delete(key);
         this.initialReportPromises.delete(key);
         this.initialReportResolvers.delete(key);
     }
     getCachedReport(host, serial, token) {
         return this.reportSnapshots.get(getPrinterKey(host, serial, token)) || null;
+    }
+    getReportReceivedAt(host, serial, token) {
+        return this.reportReceivedAt.get(getPrinterKey(host, serial, token)) ?? null;
     }
     async waitForInitialReport(host, serial, token, timeoutMs = 4000) {
         const key = getPrinterKey(host, serial, token);
@@ -329,7 +341,8 @@ class BambuClientStore {
                 const parsed = JSON.parse(payload.toString());
                 const printMessage = parsed?.print;
                 if (printMessage && typeof printMessage === "object") {
-                    this.updateReportSnapshot(key, printMessage);
+                    const telemetry = ["gcode_state", "mc_percent", "layer_num", "bed_temper", "nozzle_temper"].some(field => field in printMessage);
+                    this.updateReportSnapshot(key, printMessage, telemetry ? Date.now() : undefined);
                 }
             }
             catch {
@@ -382,6 +395,7 @@ class BambuClientStore {
         this.printers.clear();
         this.initialConnectionPromises.clear();
         this.reportSnapshots.clear();
+        this.reportReceivedAt.clear();
         this.initialReportPromises.clear();
         this.initialReportResolvers.clear();
     }
@@ -449,11 +463,17 @@ export class BambuImplementation {
      * situation the human confirmed has changed.
      */
     async confirmPrintPreflight(serial, status, inspection) {
+        const review = this.describePrintPreflight(serial, status, inspection);
+        await this.confirmHardwareAction(review.message, review.physicalCheck);
+        return review.preflight;
+    }
+    /** Describe the shared gate without accepting or dispatching anything. */
+    describePrintPreflight(serial, status, inspection) {
         const finishedJob = this.finishedJobIdentity(status);
         const cleared = this.clearedErrors.get(serial);
         const notices = hiddenHmsNotices(status?.raw, serial, inspection.model);
         const unchipped = unchippedNozzles(status?.raw);
-        await this.confirmHardwareAction(`Start a checked print on ${inspection.model.toUpperCase()} (${serial})? Nozzles: ${inspection.nozzleDiameters.join(", ")} mm. ` +
+        const message = `Start a checked print on ${inspection.model.toUpperCase()} (${serial})? Nozzles: ${inspection.nozzleDiameters.join(", ")} mm. ` +
             `Materials: ${inspection.materials.join(", ")}. Peak targets: nozzle ${inspection.maxNozzleTemperature}°C, bed ${inspection.maxBedTemperature}°C, chamber ${inspection.maxChamberTemperature}°C. ` +
             `File SHA-256: ${inspection.sha256}. Confirm the physical spool labels and that the build plate is clear.` +
             (finishedJob !== undefined ? (status.raw.gcode_state === "FAILED"
@@ -463,8 +483,9 @@ export class BambuImplementation {
             (notices.length ? ` The printer also reports ${notices.join(", ")}, which Bambu lists for this model without text and never shows as a fault; ` +
                 `${notices.length === 1 ? "it does" : "they do"} not block printing.` : "") +
             (unchipped.length ? ` Printer ${unchipped.length === 1 ? `nozzle ${unchipped[0]} reports` : `nozzles ${unchipped.join(" and ")} report`} no identity chip, ` +
-                `so ${unchipped.length === 1 ? "its" : "their"} diameter and type are the printer's configured settings; confirm they match the installed ${unchipped.length === 1 ? "hotend" : "hotends"}.` : ""), finishedJob !== undefined || !!cleared);
-        return { finishedJob, serial, model: inspection.model, notices };
+                `so ${unchipped.length === 1 ? "its" : "their"} diameter and type are the printer's configured settings; confirm they match the installed ${unchipped.length === 1 ? "hotend" : "hotends"}.` : "");
+        return { preflight: { finishedJob, serial, model: inspection.model, notices }, message,
+            physicalCheck: finishedJob !== undefined || !!cleared };
     }
     /** Stop a print whose confirmed situation changed: a newly finished job, or a hidden HMS notice the preflight did not name. */
     assertBedClearance(status, preflight) {
@@ -564,6 +585,7 @@ export class BambuImplementation {
         return readFreshPrinterStatus(await this.getPrinter(host, serial, token), serial);
     }
     async getStatus(host, serial, token) {
+        const requestedAt = Date.now();
         try {
             const printer = await this.getPrinter(host, serial, token);
             try {
@@ -605,6 +627,7 @@ export class BambuImplementation {
                 ams: data.ams || null,
                 model: resolveModelName(data),
                 serial,
+                observation: { source: "mqtt-cache", requestedAt, receivedAt: this.printerStore.getReportReceivedAt?.(host, serial, token) ?? null },
                 raw: data,
             };
         }
@@ -1317,11 +1340,10 @@ export class BambuImplementation {
                 }
                 assertActive();
                 const destination = path.posix.join(path.posix.dirname(remotePath), uniquePrintName(remotePath));
-                if (upload)
-                    await upload(snapshot, destination, assertActive);
-                else
+                const receipt = upload ? await upload(snapshot, destination, assertActive) : undefined;
+                if (!upload)
                     await this.ftpUpload(host, token, snapshot, `/${destination}`);
-                return { status: "success", uploaded: true, remotePath: destination, printRequested: false, inspected: printable };
+                return { remotePath: destination, ...receipt, status: "success", uploaded: true, printRequested: false, inspected: printable };
             }));
         }
         assertDirectPrintSupported(bambuModel, serial);

@@ -52,6 +52,12 @@ export declare class BambuImplementation {
      * situation the human confirmed has changed.
      */
     confirmPrintPreflight(serial: string, status: any, inspection: Awaited<ReturnType<typeof inspectPrintFile>>): Promise<PrintPreflight>;
+    /** Describe the shared gate without accepting or dispatching anything. */
+    describePrintPreflight(serial: string, status: any, inspection: Awaited<ReturnType<typeof inspectPrintFile>>): {
+        preflight: PrintPreflight;
+        message: string;
+        physicalCheck: boolean;
+    };
     /** Stop a print whose confirmed situation changed: a newly finished job, or a hidden HMS notice the preflight did not name. */
     assertBedClearance(status: any, preflight: PrintPreflight): void;
     private getPrinter;
@@ -113,12 +119,12 @@ export declare class BambuImplementation {
         files: string[];
         directories: Record<string, string[]>;
     }>;
-    uploadFile(host: string, serial: string, token: string, filePath: string, filename: string, print: boolean, bambuModel?: string, upload?: (snapshot: string, destination: string, assertActive: () => void) => Promise<void>): Promise<{
+    uploadFile(host: string, serial: string, token: string, filePath: string, filename: string, print: boolean, bambuModel?: string, upload?: (snapshot: string, destination: string, assertActive: () => void) => Promise<void | Record<string, unknown>>): Promise<{
         status: string;
         uploaded: boolean;
-        remotePath: string;
         printRequested: boolean;
         inspected: boolean;
+        remotePath: string;
     } | {
         status: string;
         uploaded: boolean;

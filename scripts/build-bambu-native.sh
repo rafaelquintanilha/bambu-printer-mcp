@@ -43,10 +43,20 @@ mkdir -p "$(dirname -- "$output")"
 # Compile beside the target and rename so a running server never executes a
 # partially written helper.
 temporary="$output.tmp.$$"
-trap 'rm -f "$temporary"' EXIT
+identity="$(dirname -- "$output")/libbambu-cloud-identity.dylib"
+identity_temporary="$identity.tmp.$$"
+trap 'rm -f "$temporary" "$identity_temporary"' EXIT
 # dash skips EXIT traps on signals; clean up a killed build explicitly.
-trap 'rm -f "$temporary"; exit 1' HUP INT TERM
-"$cxx_bin" -std=c++17 -O2 -Wall -Wextra -pthread -o "$temporary" "$source_file" -ldl
+trap 'rm -f "$temporary" "$identity_temporary"; exit 1' HUP INT TERM
+set --
+if [ "$(uname -s)" = Darwin ]; then
+  "$cxx_bin" -std=c++17 -O2 -Wall -Wextra -dynamiclib \
+    "$project_root/native/bambu-cloud-identity.cpp" -framework Security -framework CoreFoundation \
+    -Wl,-install_name,@rpath/libbambu-cloud-identity.dylib -o "$identity_temporary"
+  mv -f "$identity_temporary" "$identity"
+  set -- -L "$(dirname -- "$output")" -lbambu-cloud-identity -Wl,-rpath,@loader_path
+fi
+"$cxx_bin" -std=c++17 -O2 -Wall -Wextra -pthread -o "$temporary" "$source_file" -ldl "$@"
 chmod 755 "$temporary"
 mv -f "$temporary" "$output"
 trap - EXIT HUP INT TERM

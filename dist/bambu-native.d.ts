@@ -93,6 +93,17 @@ export declare function sha256File(file: string): string;
  * accepts, and its own install directory when that is not the default.
  */
 export declare function bambuNativeSetupCommand(version?: string, env?: NodeJS.ProcessEnv): string;
+type NativeInstall = {
+    helper: string;
+    env: Record<string, string>;
+};
+/**
+ * Resolve a complete native installation. On Linux the helper, the pinned
+ * plug-in and both certificates must be present before any native route is
+ * chosen, and their resolved paths are handed to the helper so server and
+ * helper can never disagree about which plug-in is loaded.
+ */
+export declare function resolveNativeInstall(): NativeInstall;
 export declare function assertBambuNativeAvailable(): void;
 /**
  * True when X2D controls should use the native route. macOS keeps its
@@ -120,4 +131,15 @@ export declare function probeBambuNative(host: string, token: string): Promise<R
 export declare function printWithBambuNative(options: BambuNativePrintOptions, onUpdate: BambuNativeUpdateCallback | undefined, execution: BambuNativeExecution & {
     beforeDispatch: () => Promise<void>;
 }): Promise<Record<string, unknown>>;
+/** Authenticated, read-only native cloud check. Never calls a print/upload entry point. */
+export declare function probeBambuCloud(serial: string, signal?: AbortSignal): Promise<{
+    authenticated: boolean;
+    printer_matched: boolean;
+    online: boolean;
+    signed_camera_authorization: string;
+    checked_at: string;
+    submission: string;
+    physical_print: string;
+}>;
 export declare function uploadWithBambuNative(options: BambuNativePrintOptions, onUpdate?: BambuNativeUpdateCallback, execution?: BambuNativeExecution): Promise<Record<string, unknown>>;
+export {};

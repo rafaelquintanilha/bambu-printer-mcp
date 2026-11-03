@@ -12,6 +12,7 @@ import { UNPINNED_PLUGIN_ENV, createFakeNativeHome } from "./fixtures/native-hom
 
 const entry = fileURLToPath(new URL("../dist/index.js", import.meta.url));
 const printerModule = new URL("../dist/printers/bambu.js", import.meta.url).href;
+const fileServiceFixture = new URL("./fixtures/file-service.mjs", import.meta.url).href;
 
 // Exercise platform dispatch on every CI OS. Only the OS selector and transport
 // boundaries are mocked; file inspection, AMS validation and preflight are real.
@@ -25,6 +26,7 @@ async function server(t, { platform = "darwin", model = "x2d", state = "IDLE", g
   await fs.writeFile(helper, `#!/usr/bin/env node
 import { appendFileSync, existsSync, readFileSync } from 'node:fs';
 import { createInterface } from 'node:readline';
+import { runFakeFileService } from ${JSON.stringify(fileServiceFixture)};
 const e = process.env;
 if (${ignoreTerm}) process.on('SIGTERM', () => {});
 const event = { kind: 'helper', pid: process.pid, mode: process.argv[2], file: e.BAMBU_NATIVE_FILE,
@@ -43,10 +45,11 @@ if (${helperFails} && process.argv[2].startsWith('--command')) {
   console.error('native_error=simulated plug-in failure');
   process.exit(1);
 }
-if (${helperDelay} && (['--print-authorized', '--upload'].includes(process.argv[2]) || event.command.print?.temp > 0)) {
+if (${helperDelay} && (['--print-authorized', '--upload', '--file-service'].includes(process.argv[2]) || event.command.print?.temp > 0)) {
   await new Promise(resolve => setTimeout(resolve, ${helperDelay}));
   appendFileSync(${JSON.stringify(eventsFile)}, JSON.stringify({kind:'sent'}) + '\\n');
 }
+if (process.argv[2] === '--file-service') { await runFakeFileService({eventsFile:${JSON.stringify(eventsFile)}}); process.exit(0); }
 if (['--print-authorized', '--command-authorized'].includes(process.argv[2])) {
   const input = createInterface({input:process.stdin});
   const authorization = new Promise(resolve => input.once('line', resolve));
@@ -384,7 +387,7 @@ test("native upload inspects every plate and cannot upload an unsafe archive", a
   assert.equal((await s.events()).some(e => e.kind === "helper"), false);
 });
 
-test("native upload honors validated plate and display metadata", async t => {
+test("native upload validates the selected plate and uses verified internal storage", async t => {
   const s = await server(t);
   const zip = await JSZip.loadAsync(await fs.readFile(s.file));
   zip.file("Metadata/plate_2.gcode", (await zip.file("Metadata/plate_1.gcode").async("string")).replace("Textured PEI Plate", "Cool Plate"));
@@ -396,11 +399,10 @@ test("native upload honors validated plate and display metadata", async t => {
   } });
   assert.notEqual(result.isError, true, JSON.stringify(result));
   const call = (await s.events()).find(e => e.kind === "helper");
-  assert.equal(call.mode, "--upload");
-  assert.equal(call.projectName, "My project");
-  assert.equal(call.presetName, "My preset");
-  assert.equal(call.plateIndex, "2");
-  assert.equal(call.bedType, "cool_plate");
+  assert.equal(call.mode, "--file-service");
+  assert.equal(result.structuredContent.downloadVerified,true);
+  assert.equal(result.structuredContent.storage,"internal");
+  assert.equal((await s.events()).some(e => e.kind === 'disconnect'), false);
 });
 
 test("native upload rejects unsupported print options and invalid metadata before helper dispatch", async t => {
@@ -541,11 +543,11 @@ for (const name of ["print_3mf", "upload_file"]) test(`MCP cancellation terminat
   const pending = (name === "print_3mf" ? s.print({ use_ams: false }, { signal: controller.signal }) :
     s.client.callTool({ name, arguments: { file_path: s.file, filename: "cube.3mf", connection_mode: "bambu_native" } }, undefined, { signal: controller.signal }))
     .catch(error => error);
-  const call = await until(async () => (await s.events()).find(e => ["--print-authorized", "--upload"].includes(e.mode)));
+  const call = await until(async () => (await s.events()).find(e => ["--print-authorized", "--file-service"].includes(e.mode)));
   controller.abort();
   assert.ok(await pending instanceof Error);
   await until(() => exited(call.pid));
-  await until(async () => { try { await fs.access(call.file); return false; } catch { return true; } });
+  if (call.file) await until(async () => { try { await fs.access(call.file); return false; } catch { return true; } });
   assert.equal((await s.events()).some(e => e.kind === "sent"), false);
 });
 

@@ -34,12 +34,12 @@ test("MCPB archive preserves runtime and licenses without local secrets or pruni
   packageMcpb({ root: fixture, outputPath, quiet: true });
 
   const archive = await JSZip.loadAsync(fs.readFileSync(outputPath));
-  for (const name of ["manifest.json", "package.json", "dist/index.js", "src/index.ts", "patches/bambu-node+3.22.21.patch", "scripts/install-patches.mjs", "scripts/build-bambu-native.sh", "scripts/setup-bambu-native.mjs", "native/bambu-native-print.cpp", "LICENSE", "README.md", "CONTRIBUTORS.md", "node_modules/mqtt/LICENSE.md", "node_modules/bambu-node/LICENSE", "node_modules/three/LICENSE", "node_modules/basic-ftp/LICENSE.txt"]) {
+  for (const name of ["manifest.json", "package.json", "dist/index.js", "src/index.ts", "patches/bambu-node+3.22.21.patch", "scripts/install-patches.mjs", "scripts/build-bambu-native.sh", "scripts/setup-bambu-native.mjs", "native/bambu-native-print.cpp", "native/bambu-cloud-identity.cpp", "LICENSE", "README.md", "CONTRIBUTORS.md", "node_modules/mqtt/LICENSE.md", "node_modules/bambu-node/LICENSE", "node_modules/three/LICENSE", "node_modules/basic-ftp/LICENSE.txt"]) {
     assert.ok(archive.file(name), `missing release file: ${name}`);
   }
   for (const name of Object.keys(archive.files)) {
     assert.doesNotMatch(name, /studio-control|launch-bambu|call-bambu|cgevent|LOCAL-X2D|local-x2d/);
-    assert.doesNotMatch(name, /^(?:bambu certs\/|bambu-mcp-config\.json|temp\/|native\/(?!bambu-native-print\.cpp$)|\.env|unrelated\.txt|node_modules\/typescript\/)/);
+    assert.doesNotMatch(name, /^(?:bambu certs\/|bambu-mcp-config\.json|temp\/|native\/(?!(?:bambu-native-print|bambu-cloud-identity)\.cpp$)|\.env|unrelated\.txt|node_modules\/typescript\/)/);
   }
   assert.equal(fs.readFileSync(path.join(fixture, "node_modules/typescript/developer-marker"), "utf8"), "PRIVATE_PACKAGING_SENTINEL");
   assert.equal(fs.readFileSync(path.join(fixture, "package.json"), "utf8"), beforePackage);

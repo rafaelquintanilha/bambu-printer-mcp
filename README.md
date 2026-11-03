@@ -1,6 +1,8 @@
 # bambu-printer-mcp
 
-This fork adds **`bambu-x2d-mcp`**, a local X2D workflow for MCP clients: model editing, Bambu Studio slicing, AMS management, upload, printing and monitoring. See the [X2D setup and tool guide](docs/X2D.md). The upstream executable and its safety checks remain available.
+This fork adds **`bambu-x2d-mcp`**, a local X2D workflow for MCP clients: model editing, Bambu Studio slicing, AMS management, upload, printing and monitoring. Its `prepare_print` (also named `print_3mf`) returns a job review and camera image; `confirm_print` requires explicit chat approval and visual plate clearance before dispatch. See the [X2D setup and tool guide](docs/X2D.md). The upstream executable and its safety checks remain available.
+
+The X2D profile also provides compact status with telemetry age, persistent observed-job history, native camera images and running-build diagnostics. `get_print_history` reads saved observations; `get_connector_info` identifies the loaded build and whether it needs restarting. These tools use Node.js 24 and do not authorize or start a print.
 
 [![bambu-printer-mcp — Print from a conversation. Browse the documentation site.](https://dmontgomery40.github.io/bambu-printer-mcp/social-card.png)](https://dmontgomery40.github.io/bambu-printer-mcp/)
 
@@ -326,7 +328,7 @@ Bambu Lab printers do not use a conventional REST API. Instead, they expose two 
 
 **MQTT (port 8883, TLS):** All printer commands and state reports flow over an MQTT broker running on the printer itself. Authentication uses username `bblp` and your LAN access code; the serial number identifies the device topics. Commands like starting a print, cancelling a job, and dispatching G-code lines are all MQTT publishes to the device topic. Status data is received by subscribing to the printer's report topic and requesting a `push_all` refresh. This implementation is based on community reverse engineering documented in the [OpenBambuAPI](https://github.com/Doridian/OpenBambuAPI) project.
 
-**FTPS (port 990, implicit TLS):** File operations (upload and directory listing) use FTPS. The printer's SD card is accessible as a filesystem with directories including `cache/` (for 3MF and G-code print files), `timelapse/`, and `logs/`. Authentication uses the username `bblp` and your access token as the password.
+**FTPS (port 990, implicit TLS):** Supported legacy file operations use FTPS. The printer's SD card is accessible as a filesystem with directories including `cache/` (for 3MF and G-code print files), `timelapse/`, and `logs/`. Authentication uses the username `bblp` and your access token as the password. X2D upload-only and model-file listing use Bambu Studio's native file service on port 6000 for internal eMMC storage. Uploads verify a complete readback against the inspected snapshot and return the actual internal path; they can run during a print without dispatching another job. See the [X2D workflow](docs/X2D.md#sending-versus-printing).
 
 ### What this fork fixes
 
@@ -610,6 +612,8 @@ High-signal fields:
 #### list_printer_files
 
 List files stored on the printer's SD card. Scans the `cache/`, `timelapse/`, and `logs/` directories and returns both a flat list and a directory-grouped breakdown.
+
+For X2D, list internal model storage through the native file service instead. Results include actual printer paths, sizes and timestamps under `entries`, a flat `files` list, `directories.internal`, and `storage: "internal"`. External SD/USB storage and logs are not included in this route. The `printer://{host}/files` resource uses the same listing.
 
 This is a read-only query: it never creates directories. Optional directories absent from a successful root listing return empty lists. Authentication, TLS, permission, and transfer failures are reported as errors rather than empty or partial results.
 

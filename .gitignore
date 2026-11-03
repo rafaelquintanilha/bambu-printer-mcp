@@ -22,6 +22,7 @@ result.json
 
 # Native X2D helper is built locally against the installed Bambu networking plug-in.
 native/bambu-native-print
+native/libbambu-cloud-identity.dylib
 native/bambu-native-print-*
 native/*.dSYM/
 # Packed Claude Desktop extension bundle

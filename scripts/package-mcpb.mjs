@@ -60,6 +60,7 @@ export function packageMcpb({ root = ROOT, outputPath = path.join(root, "bambu-p
     copyReleaseInput(path.join(root, "scripts/install-patches.mjs"), path.join(staging, "scripts/install-patches.mjs"));
     fs.mkdirSync(path.join(staging, "native"));
     copyReleaseInput(path.join(root, "native/bambu-native-print.cpp"), path.join(staging, "native/bambu-native-print.cpp"));
+    copyReleaseInput(path.join(root, "native/bambu-cloud-identity.cpp"), path.join(staging, "native/bambu-cloud-identity.cpp"));
     copyReleaseInput(path.join(root, "scripts/build-bambu-native.sh"), path.join(staging, "scripts/build-bambu-native.sh"));
     copyReleaseInput(path.join(root, "scripts/setup-bambu-native.mjs"), path.join(staging, "scripts/setup-bambu-native.mjs"));
     for (const name of ["CONTRIBUTORS", "CONTRIBUTORS.md"]) {

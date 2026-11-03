@@ -2,11 +2,29 @@
 
 ## Unreleased
 
+- Preserve file-transfer phase, native error code, and whether an upload began in MCP errors and storage diagnostics. Give separate recovery steps for connection failures and uncertain uploads, and direct stale sessions to reconnect without re-slicing or replaying a transfer.
+
+### Reliability
+- Validate the installed Studio and networking plug-in signatures on macOS, then supply Studio's signing identity only when that plug-in inspects the standalone cloud helper. Keep the official signing implementation and print-review gates; missing or modified installation files stop before network submission.
+- Check signed cloud authorization separately from account login using a protected camera-URL request. Reject error-text callbacks and missing verification receipts without exposing the returned camera credentials or submitting a print.
+- Refresh the app certificate, select and subscribe to the cloud printer, and wait for its capability report before submission. A cloud login alone does not initialize the plug-in's secured-printer flags or signing credentials; missing reports stop before upload or print dispatch.
+- Add an explicit macOS cloud print route using the configured Studio login and networking plug-in, without opening Studio. Verify account/printer binding, derive AMS/nozzle details from the checked artifact, preserve fresh dispatch approval, isolate the temporary session, and never fall back or replay an uncertain cloud submission. Cloud authentication is verified separately from physical print delivery.
+- Add opt-in read-only cloud and local-storage checks to connector diagnostics. Refuse uploads and print confirmation through stale connector builds.
+- Report the failed local file-service stage and whether an upload began. Bound connection setup and stop suggesting unchanged retries after transport failures.
+
 ### Fixed
+- Use Bambu Studio's file-only tunnel for X2D internal uploads and model-file listing. Keep active MQTT monitoring connected, refuse existing filenames, and verify uploaded byte counts, SHA-256 and printer MD5 through a complete readback before reporting success. File transfers never dispatch a print and can run while another job prints.
+- Bound repeated firmware-module reports by removing exact duplicates while retaining conflicting identities. Timestamp received printer telemetry separately from cached reads and version replies.
+- Explain native `SIGNED_ERROR (-26)` print rejections as an authorization failure, distinguish possible upload from rejected dispatch, and preserve recovery instructions instead of suggesting an unchanged retry. Uncertain dispatch errors also retain their instruction to check the printer before resubmitting.
+- Replace the dedicated X2D profile's print elicitation form with job-bound chat approval and fresh camera clearance. Preparation returns the selected objects, spool colors and settings without dispatch; confirmation consumes a one-use, expiring review and preserves fresh file, identity, nozzle, material, error and job checks through native dispatch. The generic executable retains form confirmation.
 - Remove the unsupported top-level TLS option from the FFmpeg RTSP command. FFmpeg 7.1 can capture an enabled X2D camera stream over encrypted RTSPS instead of failing with `Option tls_verify not found`.
 - Diagnose X2D camera capture failures when the printer reports LAN Only Liveview is disabled. Explain the touchscreen camera setting separately from LAN Only Mode, preserve other capture errors, and keep the file-transfer port out of camera routing.
 
 ### Added
+- Find saved MakerWorld models and prepared local slices before downloading or slicing. Cache browser collection observations and unchanged file metadata, link by design identity or labeled title matches, group byte-identical copies, and report plates, colors, support settings and estimates without a slicer. Optional printer listing checks distinguish name/size matches from checksum verification and Handy availability.
+- Return compact X2D status with task identifiers, stage, errors and observation age; make full raw telemetry explicit. Keep the generic profile's full response and independent print-safety checks.
+- Persist the latest 100 observed X2D jobs per printer in private SQLite storage, including externally started jobs. Expose saved history with `get_print_history`, preserve unknown endings, and keep concurrent sessions from overwriting newer observations.
+- Expose running-build fingerprints, restart detection, tool capabilities and local native prerequisites through `get_connector_info`, without contacting the printer.
 - Add the `bambu-x2d-mcp` stdio entry point for a configured X2D and Bambu Studio, retaining model editing, optional Blender integration, slicing, AMS management, upload, printing and monitoring. Validate tool arguments, keep printer credentials and executable paths in local configuration, and reject tools outside the profile.
 - Keep X2D upload-only and print actions separate. Native print receipts expose the dispatched job identity; the X2D profile reports `dispatched` with `physicalPrintVerified: false` until the client independently checks printer status. Retain upstream hardware validation and human confirmation.
 

@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { withStudioCloudSession } from "./bambu-cloud.js";
 
 export type BambuNativePrintOptions = {
   host: string;
@@ -214,7 +215,7 @@ function isRegularFile(file: string): boolean {
  * chosen, and their resolved paths are handed to the helper so server and
  * helper can never disagree about which plug-in is loaded.
  */
-function resolveNativeInstall(): NativeInstall {
+export function resolveNativeInstall(): NativeInstall {
   if (!isBambuNativePlatform()) {
     throw new Error("Bambu native X2D transport requires macOS or x86-64 Linux and Bambu's networking plug-in.");
   }
@@ -348,7 +349,7 @@ export async function interruptNativeOperations(serial: string): Promise<void> {
 }
 
 function runNativeHelper(
-  mode: "--probe" | "--print-authorized" | "--upload" | "--command" | "--command-authorized",
+  mode: "--probe" | "--probe-cloud" | "--print-authorized" | "--cloud-print-authorized" | "--upload" | "--command" | "--command-authorized",
   env: NodeJS.ProcessEnv,
   timeoutMs: number,
   onUpdate?: BambuNativeUpdateCallback,
@@ -356,7 +357,8 @@ function runNativeHelper(
 ): Promise<NativeHelperResult> {
   execution.signal?.throwIfAborted();
   execution.assertActive?.();
-  const needsAuthorization = mode === "--print-authorized" || mode === "--command-authorized";
+  const cloud = mode === "--cloud-print-authorized" || mode === "--probe-cloud";
+  const needsAuthorization = mode === "--print-authorized" || mode === "--cloud-print-authorized" || mode === "--command-authorized";
   if (needsAuthorization && typeof execution.beforeDispatch !== "function") {
     throw new Error("Native dispatch requires a beforeDispatch fresh-state check.");
   }
@@ -446,13 +448,15 @@ function runNativeHelper(
             void authorizeDispatch(trimmed);
             continue;
           }
+          if (cloud && !/^native_(?:cloud_(?:session|server|query)|cloud_signing=(?:verified|rejected)$|cloud_device=(?:ready|timeout)$|cloud_capability_request=-?\d+$|update status=\d+ code=-?\d+$|print result=-?\d+$)/.test(trimmed)) continue;
           updates.push(trimmed);
           onUpdate?.(trimmed);
         }
       }
     });
     child.stderr.on("data", (chunk: Buffer) => {
-      stderr = tail(stderr + chunk.toString("utf8"));
+      // Vendor diagnostics may contain account details or signed URLs.
+      if (!cloud) stderr = tail(stderr + chunk.toString("utf8"));
     });
     child.on("error", (error) => {
       // Node emits close after a spawn failure too. Keep one exit/cleanup path.
@@ -468,7 +472,7 @@ function runNativeHelper(
         return;
       }
       const trailing = stdout.trim();
-      if (trailing) {
+      if (trailing && !cloud) {
         updates.push(trailing);
         onUpdate?.(trailing);
       }
@@ -838,9 +842,12 @@ export async function printWithBambuNative(
   if (typeof execution?.beforeDispatch !== "function") {
     throw new Error("Native printing requires a beforeDispatch fresh-state check.");
   }
-  const result = await runNativeHelper(
+  const route = process.env.BAMBU_NATIVE_PRINT_ROUTE || "local";
+  if (!["local", "cloud"].includes(route)) throw new Error("BAMBU_NATIVE_PRINT_ROUTE must be local or cloud.");
+  const cloud = route === "cloud";
+  const dispatch = (cloudEnv: NodeJS.ProcessEnv = {}) => runNativeHelper(
     // Older compiled helpers reject this mode before connecting or printing.
-    "--print-authorized",
+    cloud ? "--cloud-print-authorized" : "--print-authorized",
     {
       ...process.env,
       BAMBU_NATIVE_CONFIRM: "1",
@@ -867,15 +874,33 @@ export async function printWithBambuNative(
       BAMBU_NATIVE_LAYER_INSPECT: boolEnv(options.layerInspect, false),
       BAMBU_NATIVE_TIMELAPSE: boolEnv(options.timelapse, false),
       ...(options.externalStorage === undefined ? {} : { BAMBU_NATIVE_TRY_EMMC_PRINT: String(!options.externalStorage) }),
+      ...cloudEnv,
     },
     300_000,
     onUpdate,
     execution
   );
+  const result = cloud ? await withStudioCloudSession(options.serial, execution.signal, dispatch) : await dispatch();
   if (result.resultCode !== 0) {
+    if (cloud && result.authorizedAttempts === 0 && result.updates.includes("native_cloud_device=timeout")) {
+      throw new Error("Cloud printer capability report timed out before upload or dispatch; no job was submitted. Cloud login succeeded, but the selected printer did not finish its status handshake.");
+    }
+    if (cloud && result.authorizedAttempts > 0) {
+      throw new Error(`Bambu cloud print submission failed or is uncertain (helper ${result.resultCode}). Check the printer job and cloud history before any new submission; do not automatically resend or fall back to local printing. ${result.updates.filter(line => line.startsWith("native_print result=")).join("; ")}`);
+    }
     const explicitRejection = result.updates.some(line => /^native_print result=-?[1-9]\d*$/.test(line));
     if (result.authorizedAttempts > 0 && (result.updates.includes("native_print result=0") || (result.signal && !explicitRejection))) {
       throw new Error("Bambu native print dispatch is uncertain: the printer may have accepted this job before the helper exited. Check printer status and the job name before retrying; do not automatically resend it.");
+    }
+    if (result.updates.includes("native_print result=-26")) {
+      throw new Error(
+        "Bambu native print signing was rejected: SIGNED_ERROR (-26). " +
+        "The file may have uploaded, but the plug-in rejected print dispatch. " +
+        "A working status connection or upload does not verify command signing. " +
+        "Retrying unchanged will not fix this authorization error. " +
+        "Use the official Bambu Studio or Bambu Connect application to submit the reviewed job, " +
+        "or configure a compatible native helper; check printer status and the job name before any new submission."
+      );
     }
     const detail = [
       ...result.updates,
@@ -883,14 +908,29 @@ export async function printWithBambuNative(
     ]
       .filter((line) => line.startsWith("native_error=") || line.startsWith("native_print result=") || line.startsWith("local MQTT connection"))
       .join("; ");
-    throw new Error(`Bambu native local print failed (${result.resultCode})${detail ? `: ${detail}` : "."}`);
+    throw new Error(`Bambu native ${route} print failed (${result.resultCode})${detail ? `: ${detail}` : "."}`);
   }
   return {
     status: "success",
-    route: "bambu:///local",
+    route: cloud ? "bambu-cloud" : "bambu:///local",
     ...(options.externalStorage === undefined ? {} : { storage: options.externalStorage ? "external" : "internal" }),
     updates: result.updates,
   };
+}
+
+/** Authenticated, read-only native cloud check. Never calls a print/upload entry point. */
+export async function probeBambuCloud(serial: string, signal?: AbortSignal) {
+  return withStudioCloudSession(serial, signal, async cloudEnv => {
+    const result = await runNativeHelper("--probe-cloud", { ...process.env, ...cloudEnv, BAMBU_NATIVE_SERIAL: serial }, 40_000, undefined, { signal });
+    if (result.updates.includes("native_cloud_signing=rejected")) throw new Error("Cloud login succeeded, but the signed camera-URL check was rejected or timed out; no print was submitted.");
+    if (result.resultCode !== 0) throw new Error(`Native cloud connection check failed (helper ${result.resultCode}); no job was submitted.`);
+    if (!result.updates.includes("native_cloud_signing=verified")) throw new Error("Native cloud check did not verify signed authorization; rebuild the helper. No print was submitted.");
+    const response = JSON.parse(await fs.promises.readFile(path.join(cloudEnv.BAMBU_NATIVE_CONFIG_DIR!, "cloud-probe-response.json"), "utf8"));
+    const device = response.devices?.find((entry: any) => entry.dev_id === serial);
+    if (!device) throw new Error("Native cloud response did not match the configured printer; no job was submitted.");
+    return { authenticated: true, printer_matched: true, online: device.dev_online === true, signed_camera_authorization: "verified", checked_at: new Date().toISOString(),
+      submission: "not_checked", physical_print: "not_checked" };
+  });
 }
 
 export async function uploadWithBambuNative(

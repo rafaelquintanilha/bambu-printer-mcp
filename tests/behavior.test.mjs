@@ -395,6 +395,8 @@ test("native upload forwards helper progress before returning the final result",
     helperPath,
     [
       "#!/usr/bin/env node",
+      `import {runFakeFileService} from ${JSON.stringify(new URL('./fixtures/file-service.mjs', import.meta.url).href)};`,
+      "if(process.argv[2]==='--file-service') { await runFakeFileService(); process.exit(0); }",
       "console.log('native_update status=1 code=12 msg=12%');",
       "console.log('native_update status=1 code=68 msg=68%');",
       "console.log('native_upload result=0');",
@@ -440,11 +442,17 @@ test("native upload forwards helper progress before returning the final result",
     "native_upload result=0",
   ]);
 
-  const uploadPath = path.join(tempDir, "test.txt");
-  fs.writeFileSync(uploadPath, "upload fixture");
+  const uploadPath = path.join(tempDir, "test.gcode");
+  fs.writeFileSync(uploadPath, "; printer_model = Bambu Lab X2D\n; nozzle_diameter = 0.4;0.4\n; filament_type = PLA\nG1 X0 Y0\n");
+  const preload = `
+    import {BambuImplementation} from ${JSON.stringify(new URL('../dist/printers/bambu.js', import.meta.url).href)};
+    BambuImplementation.prototype.getSafetyStatus = async (_host, serial) => ({connected:true,serial,model:'x2d',status:'RUNNING',
+      raw:{serial,model:'x2d',gcode_state:'RUNNING',print_error:0,hms:[],nozzle_diameter:['0.4','0.4']},
+      observation:{source:'mqtt',identitySource:'report',receivedAt:Date.now(),requestedAt:Date.now()-1}});
+  `;
   const transport = new StdioClientTransport({
     command: process.execPath,
-    args: [SERVER_ENTRY],
+    args: ["--import", `data:text/javascript,${encodeURIComponent(preload)}`, SERVER_ENTRY],
     env: {
       ...process.env,
       MCP_TRANSPORT: "stdio",
@@ -475,7 +483,7 @@ test("native upload forwards helper progress before returning the final result",
       name: "upload_file",
       arguments: {
         file_path: uploadPath,
-        filename: "test.txt",
+        filename: "test.gcode",
         bambu_model: "x2d",
         connection_mode: "bambu_native",
       },
@@ -486,8 +494,8 @@ test("native upload forwards helper progress before returning the final result",
   assert.equal(uploadResult.status, "success");
   assert.deepEqual(wireMessages.map(message => message.method === "notifications/progress"
     ? message.params.message : Object.hasOwn(message, "result") ? "response" : message.method), [
-    "native_update status=1 code=12 msg=12%",
-    "native_update status=1 code=68 msg=68%",
+    "internal_upload stage=sending",
+    "internal_upload stage=readback",
     "response",
   ]);
 });

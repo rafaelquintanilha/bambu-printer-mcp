@@ -212,7 +212,8 @@ int main(int argc, char **argv) {
   catch(const std::exception &error) { std::cerr<<error.what()<<std::endl; return 1; }
 }
 `);
-  const compiled = spawnSync(process.env.CXX || "c++", ["-std=c++17", "-O0", driver, "-o", executable, "-ldl", "-pthread"], { encoding: "utf8", timeout: 60000 });
+  const frameworks = process.platform === "darwin" ? [fileURLToPath(new URL("../native/bambu-cloud-identity.cpp", import.meta.url)), "-framework", "Security", "-framework", "CoreFoundation"] : [];
+  const compiled = spawnSync(process.env.CXX || "c++", ["-std=c++17", "-O0", driver, "-o", executable, "-ldl", "-pthread", ...frameworks], { encoding: "utf8", timeout: 60000 });
   assert.equal(compiled.status, 0, compiled.error?.message || compiled.stderr);
   const file = path.join(directory, "test.3mf");
   await fs.writeFile(file, "stub plug-in never reads this fixture");
@@ -286,6 +287,18 @@ test('explicit native print rejection remains a failure', async t => {
   await assert.rejects(printWithBambuNative(options, undefined, {beforeDispatch:async()=>{}}), /failed.*20/);
 });
 
+test('native signing rejection explains authorization and does not replay the print', async t => {
+  const events = await helper(t, {printResult:-26});
+  await assert.rejects(printWithBambuNative(options, undefined, {beforeDispatch:async()=>{}}), error => {
+    assert.match(error.message, /SIGNED_ERROR \(-26\)/);
+    assert.match(error.message, /may have uploaded.*rejected print dispatch/);
+    assert.match(error.message, /Retrying unchanged will not fix/);
+    assert.match(error.message, /Bambu Studio or Bambu Connect/);
+    return true;
+  });
+  assert.equal((await events()).filter(e=>e.kind==='dispatched').length,1);
+});
+
 test("compiled native command exits cleanly even when plug-in teardown would crash at process exit", { skip: process.platform === "win32" }, async t => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "bambu-native-exit-"));
   t.after(() => fs.rm(directory, { recursive: true, force: true }));
@@ -324,7 +337,8 @@ int main() {
   return 0;
 }
 `);
-  const compiled = spawnSync(process.env.CXX || "c++", ["-std=c++17", "-O0", driver, "-o", executable, "-ldl", "-pthread"], { encoding: "utf8", timeout: 60000 });
+  const frameworks = process.platform === "darwin" ? [fileURLToPath(new URL("../native/bambu-cloud-identity.cpp", import.meta.url)), "-framework", "Security", "-framework", "CoreFoundation"] : [];
+  const compiled = spawnSync(process.env.CXX || "c++", ["-std=c++17", "-O0", driver, "-o", executable, "-ldl", "-pthread", ...frameworks], { encoding: "utf8", timeout: 60000 });
   assert.equal(compiled.status, 0, compiled.error?.message || compiled.stderr);
   const env = { ...process.env, BAMBU_NATIVE_HOST: "127.0.0.1", BAMBU_NATIVE_SERIAL: "20PEXIT", BAMBU_NATIVE_ACCESS_CODE: "DUMMY",
     BAMBU_NATIVE_COMMAND_CONFIRM: "1", BAMBU_NATIVE_COMMAND_JSON: JSON.stringify({ print: { command: "pause", sequence_id: "1" } }) };
