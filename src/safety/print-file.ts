@@ -315,10 +315,16 @@ export async function inspectPrintFile(filePath: string, options: {model:string;
   if(options.bedType && (!bedType || normalizeBed(options.bedType)!==bedType)) return fail('selected bed type cannot be verified or contradicts the sliced file; re-slice with the intended bed');
   validateBounds(metadata,model,plate);
   const used=new Set<number>();
-  const requirePosition=(position:number):number=>{
+  const referenced=new Set<number>();
+  // Plate metadata and explicit filament selections establish spool use. A
+  // temperature reference (M620.17/G383 L, heater targets) is checked against
+  // that declared material and counts as use only when nothing else does, so a
+  // startup calibration naming an unused project filament needs no AMS tray.
+  const declaredPosition=(position:number):number=>{
     if(!Number.isInteger(position)||position<0||position>=materials.length) return fail(`filament/tool position ${position} has no declared material`);
-    used.add(position);return position;
+    referenced.add(position);return position;
   };
+  const requirePosition=(position:number):number=>{used.add(declaredPosition(position));return position;};
   if(plate.filament_ids !== undefined) {
     if(!Array.isArray(plate.filament_ids)||!plate.filament_ids.length) return fail('malformed selected plate filament_ids metadata');
     for(const value of plate.filament_ids) {if(typeof value!=='number' || !Number.isInteger(value)) return fail('malformed selected plate filament position');requirePosition(value);}
@@ -332,7 +338,7 @@ export async function inspectPrintFile(filePath: string, options: {model:string;
   const startupEnds=lines.flatMap((line,index)=>/^\s*;\s*MACHINE_START_GCODE_END\s*$/i.test(line)?[index]:[]);
   const h2cStartup=(index:number)=>model==='h2c' && !depositionStarted && startupStarts.length===1 && startupEnds.length===1 && index>startupStarts[0] && index<startupEnds[0];
   const heat=(component:'nozzle'|'bed'|'chamber',value:number,position?:number,allMaterials=false,startupPurge=false)=>{
-    const affected=allMaterials || position===undefined ? materials.map((_,index)=>index) : [requirePosition(position)];
+    const affected=allMaterials || position===undefined ? materials.map((_,index)=>index) : [declaredPosition(position)];
     if(component==='nozzle' && startupPurge) validateStartupPurgeTemperature(value,model,affected.map(index=>materials[index]));
     else validateTemperature(component,value,model,affected.map(index=>materials[index]));
     // Candidate materials constrain heat, but only plate metadata and explicit
@@ -483,7 +489,7 @@ export async function inspectPrintFile(filePath: string, options: {model:string;
         const expected=code==='G383.7'?'UJ':code==='G383.3'?'UL':'OUL';
         if(!h2cStartup(index) || args.size!==expected.length || [...args.keys()].some(key=>!expected.includes(key)) || args.get('U')!==140 ||
            (code==='G383.7' && args.get('J')!==0) || (code==='G383' && args.get('O')!==2)) fail('unsupported H2C startup probing parameters');
-        const position=args.has('L')?requirePosition(args.get('L')!):active;
+        const position=args.has('L')?declaredPosition(args.get('L')!):active;
         heat('nozzle',args.get('U')!,position);
       } else if(code==='G383' || code==='G383.3') {
         // Bambu probing routines carry nozzle temperature in T and optionally
@@ -491,7 +497,7 @@ export async function inspectPrintFile(filePath: string, options: {model:string;
         const args=parameters(argumentsText);
         if(args.has('U')) fail('unsupported G383 temperature parameter U outside H2C startup');
         if(code==='G383.3' && (!args.has('T') || [...args.keys()].some(key=>!'TL'.includes(key)))) fail('unsupported G383.3 temperature parameters');
-        const position=args.has('L')?requirePosition(args.get('L')!):active;
+        const position=args.has('L')?declaredPosition(args.get('L')!):active;
         if(args.has('T')) heat('nozzle',args.get('T')!,position);
       } else if(code==='G383.4' && !argumentsText) {
         // Official H2D startup: left-extruder load status detection, no target.
@@ -525,7 +531,7 @@ export async function inspectPrintFile(filePath: string, options: {model:string;
           // of the two physical nozzles, whatever the file declares.
           if(args.get('T')!>1) fail('unsupported M620.17 nozzle/material temperature mapping');
           heat('nozzle',args.get('S')!,undefined,true);
-        } else heat('nozzle',args.get('S')!,requirePosition(args.get('L')!));
+        } else heat('nozzle',args.get('S')!,args.get('L')!);
       } else if((/^M620\./.test(code) && !['M620.3','M620.6','M620.11'].includes(code)) || /^M621\./.test(code)) {
         fail(`unsupported thermal-affecting filament command ${code}`);
       } else if(code==='M145') {
@@ -543,6 +549,7 @@ export async function inspectPrintFile(filePath: string, options: {model:string;
     } catch(error) {throw new Error(`Print safety line ${index+1}: ${error instanceof Error?error.message:String(error)}`);}
   }
   if(!commandCount) return fail('selected G-code contains no printable commands');
+  if(!used.size) referenced.forEach(index=>used.add(index));
   if(!used.size) materials.forEach((_,index)=>used.add(index));
   return {model,nozzleDiameters,materials,usedFilamentPositions:[...used].sort((a,b)=>a-b),plateInternalPath,sha256,maxNozzleTemperature,maxBedTemperature,maxChamberTemperature,bedType,selectsAms,nozzleTypes,nozzleFlows,filamentNozzleIndices};
 }

@@ -474,6 +474,19 @@ test('X2D OrcaSlicer idle-nozzle preheat and time-lapse capture pass with heater
   assert.equal(result.maxNozzleTemperature,230);
   assert.deepEqual(result.usedFilamentPositions,[0],'a nozzle without filament (L-1) selects no filament');
 });
+// Bambu Studio 02.08.04 X2D toolhead-offset calibration names project filaments
+// 0 and 1 for nozzle temperatures. A plate that uses only filament 1 (the 18 mm
+// cable clips sliced in white) must not need a tray for unused filament 0.
+test('X2D Studio offset-calibration temperature references do not claim unused filaments', async t => {
+  const calibration='M622 J1\nM620.17 T0 S220 L0\nM620.17 T1 S220 L1\nM620 D-1\nG383 O1 T220 L1\nM623\n';
+  const entries={'Metadata/project_settings.config':{printer_model:'Bambu Lab X2D',nozzle_diameter:['0.4','0.4'],filament_type:['PLA','PLA','PLA','PLA','PETG']},'Metadata/plate_1.json':{filament_ids:[1]}};
+  const result=await inspect(t,'',{model:'x2d'},{...entries,'Metadata/plate_1.gcode':calibration+'G1 X10 Y10 E1\n'});
+  assert.deepEqual(result.usedFilamentPositions,[1]);
+  assert.equal(result.maxNozzleTemperature,220);
+  // The reference is still checked against the named filament's declared material.
+  await assert.rejects(inspect(t,'',{model:'x2d'},{...entries,'Metadata/plate_1.gcode':'M620.17 T0 S270 L0\n'}),/PLA nozzle temperature 270/);
+  await assert.rejects(inspect(t,'',{model:'x2d'},{...entries,'Metadata/plate_1.gcode':'M620.17 T0 S220 L5\n'}),/position 5 has no declared material/);
+});
 for(const model of ['H2D','H2D Pro']) test(`${model} Orca single-filament startup preheats the unused nozzle without claiming a filament`, async t => {
   const result=await inspect(t,header(model,'PLA','0.4;0.4')+'M620.17 T0 S220 L0\nM620.17 T1 S220 L-1\nG1 X10 Y10 E1\n',{model:model.toLowerCase()});
   assert.deepEqual(result.usedFilamentPositions,[0]);

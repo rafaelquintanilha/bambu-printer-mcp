@@ -394,12 +394,18 @@ export async function inspectPrintFile(filePath, options) {
         return fail('selected bed type cannot be verified or contradicts the sliced file; re-slice with the intended bed');
     validateBounds(metadata, model, plate);
     const used = new Set();
-    const requirePosition = (position) => {
+    const referenced = new Set();
+    // Plate metadata and explicit filament selections establish spool use. A
+    // temperature reference (M620.17/G383 L, heater targets) is checked against
+    // that declared material and counts as use only when nothing else does, so a
+    // startup calibration naming an unused project filament needs no AMS tray.
+    const declaredPosition = (position) => {
         if (!Number.isInteger(position) || position < 0 || position >= materials.length)
             return fail(`filament/tool position ${position} has no declared material`);
-        used.add(position);
+        referenced.add(position);
         return position;
     };
+    const requirePosition = (position) => { used.add(declaredPosition(position)); return position; };
     if (plate.filament_ids !== undefined) {
         if (!Array.isArray(plate.filament_ids) || !plate.filament_ids.length)
             return fail('malformed selected plate filament_ids metadata');
@@ -421,7 +427,7 @@ export async function inspectPrintFile(filePath, options) {
     const startupEnds = lines.flatMap((line, index) => /^\s*;\s*MACHINE_START_GCODE_END\s*$/i.test(line) ? [index] : []);
     const h2cStartup = (index) => model === 'h2c' && !depositionStarted && startupStarts.length === 1 && startupEnds.length === 1 && index > startupStarts[0] && index < startupEnds[0];
     const heat = (component, value, position, allMaterials = false, startupPurge = false) => {
-        const affected = allMaterials || position === undefined ? materials.map((_, index) => index) : [requirePosition(position)];
+        const affected = allMaterials || position === undefined ? materials.map((_, index) => index) : [declaredPosition(position)];
         if (component === 'nozzle' && startupPurge)
             validateStartupPurgeTemperature(value, model, affected.map(index => materials[index]));
         else
@@ -653,7 +659,7 @@ export async function inspectPrintFile(filePath, options) {
                 if (!h2cStartup(index) || args.size !== expected.length || [...args.keys()].some(key => !expected.includes(key)) || args.get('U') !== 140 ||
                     (code === 'G383.7' && args.get('J') !== 0) || (code === 'G383' && args.get('O') !== 2))
                     fail('unsupported H2C startup probing parameters');
-                const position = args.has('L') ? requirePosition(args.get('L')) : active;
+                const position = args.has('L') ? declaredPosition(args.get('L')) : active;
                 heat('nozzle', args.get('U'), position);
             }
             else if (code === 'G383' || code === 'G383.3') {
@@ -664,7 +670,7 @@ export async function inspectPrintFile(filePath, options) {
                     fail('unsupported G383 temperature parameter U outside H2C startup');
                 if (code === 'G383.3' && (!args.has('T') || [...args.keys()].some(key => !'TL'.includes(key))))
                     fail('unsupported G383.3 temperature parameters');
-                const position = args.has('L') ? requirePosition(args.get('L')) : active;
+                const position = args.has('L') ? declaredPosition(args.get('L')) : active;
                 if (args.has('T'))
                     heat('nozzle', args.get('T'), position);
             }
@@ -712,7 +718,7 @@ export async function inspectPrintFile(filePath, options) {
                     heat('nozzle', args.get('S'), undefined, true);
                 }
                 else
-                    heat('nozzle', args.get('S'), requirePosition(args.get('L')));
+                    heat('nozzle', args.get('S'), args.get('L'));
             }
             else if ((/^M620\./.test(code) && !['M620.3', 'M620.6', 'M620.11'].includes(code)) || /^M621\./.test(code)) {
                 fail(`unsupported thermal-affecting filament command ${code}`);
@@ -742,6 +748,8 @@ export async function inspectPrintFile(filePath, options) {
     }
     if (!commandCount)
         return fail('selected G-code contains no printable commands');
+    if (!used.size)
+        referenced.forEach(index => used.add(index));
     if (!used.size)
         materials.forEach((_, index) => used.add(index));
     return { model, nozzleDiameters, materials, usedFilamentPositions: [...used].sort((a, b) => a - b), plateInternalPath, sha256, maxNozzleTemperature, maxBedTemperature, maxChamberTemperature, bedType, selectsAms, nozzleTypes, nozzleFlows, filamentNozzleIndices };
