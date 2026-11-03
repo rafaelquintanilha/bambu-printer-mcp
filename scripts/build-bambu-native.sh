@@ -39,6 +39,22 @@ if ! command -v "$cxx_bin" >/dev/null 2>&1; then
   exit 1
 fi
 
+# Without SDKROOT, clang can pair Xcode's linker with a newer Command Line
+# Tools SDK that it cannot read. Use the SDK of the selected developer tools.
+if [ "$(uname -s)" = Darwin ] && [ -z "${SDKROOT:-}" ] && command -v xcrun >/dev/null 2>&1; then
+  sdk=$(xcrun --sdk macosx --show-sdk-path 2>/dev/null || true)
+  if [ -n "$sdk" ]; then
+    SDKROOT=$sdk
+    export SDKROOT
+  fi
+fi
+
+sha256_of() {
+  if command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | cut -d ' ' -f 1
+  else sha256sum "$1" | cut -d ' ' -f 1
+  fi
+}
+
 mkdir -p "$(dirname -- "$output")"
 # Compile beside the target and rename so a running server never executes a
 # partially written helper.
@@ -59,5 +75,11 @@ fi
 "$cxx_bin" -std=c++17 -O2 -Wall -Wextra -pthread -o "$temporary" "$source_file" -ldl "$@"
 chmod 755 "$temporary"
 mv -f "$temporary" "$output"
+# Record the compiled sources. The server refuses a package-local helper whose
+# record does not match the current source, instead of failing mid-operation.
+receipt="$output-source.json"
+printf '{"bambu-native-print.cpp":"%s","bambu-cloud-identity.cpp":"%s"}\n' \
+  "$(sha256_of "$source_file")" "$(sha256_of "$project_root/native/bambu-cloud-identity.cpp")" > "$receipt.tmp.$$"
+mv -f "$receipt.tmp.$$" "$receipt"
 trap - EXIT HUP INT TERM
 echo "Built $output"

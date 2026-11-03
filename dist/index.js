@@ -2939,7 +2939,16 @@ class BambuPrinterMCPServer {
                             throw new McpError(ErrorCode.MethodNotFound, "Connector diagnostics are available in the dedicated X2D profile.");
                         const diskBuildId = connectorBuildId(this.distributionDirectory);
                         const diskVersion = JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
-                        const unavailable = bambuNativeUnavailableReason();
+                        // macOS routing is unconditional, but report a missing or stale helper here.
+                        const unavailable = bambuNativeUnavailableReason() ?? (() => {
+                            try {
+                                assertBambuNativeAvailable();
+                                return undefined;
+                            }
+                            catch (error) {
+                                return error instanceof Error ? error.message : String(error);
+                            }
+                        })();
                         result = {
                             name: "bambu-x2d-mcp", version: this.packageVersion, build_id: this.buildId,
                             started_at: this.startedAt, disk_build_id: diskBuildId, disk_version: diskVersion,

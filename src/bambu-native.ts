@@ -149,6 +149,19 @@ export function sha256File(file: string): string {
   return sha256Hex(fs.readFileSync(file));
 }
 
+/** Sources scripts/build-bambu-native.sh compiles and records beside the helper. */
+export const BAMBU_NATIVE_HELPER_SOURCES = ["bambu-native-print.cpp", "bambu-cloud-identity.cpp"] as const;
+
+/** True when the build receipt names exactly the current helper sources. */
+export function nativeHelperReceiptMatches(receiptFile: string, sourceDirectory: string): boolean {
+  try {
+    const receipt = JSON.parse(fs.readFileSync(receiptFile, "utf8"));
+    return BAMBU_NATIVE_HELPER_SOURCES.every(name => receipt?.[name] === sha256File(path.join(sourceDirectory, name)));
+  } catch {
+    return false;
+  }
+}
+
 let nativeSourceSha256: string | undefined;
 /** The packaged helper source never changes while the server runs. */
 function packagedHelperSha256(): string {
@@ -220,7 +233,15 @@ export function resolveNativeInstall(): NativeInstall {
     throw new Error("Bambu native X2D transport requires macOS or x86-64 Linux and Bambu's networking plug-in.");
   }
   const helper = resolveNativeHelper();
-  if (process.platform !== "linux") return { helper, env: {} };
+  if (process.platform !== "linux") {
+    // The package-local helper is built locally and not tracked. One built from
+    // older source can disagree with this server about the native protocol.
+    const local = path.resolve(PACKAGE_ROOT, "native/bambu-native-print");
+    if (samePath(helper, local) && !nativeHelperReceiptMatches(`${local}-source.json`, path.dirname(local))) {
+      throw new Error("The native helper was built from older source. Run `npm run build:native`, then retry; nothing was sent.");
+    }
+    return { helper, env: {} };
+  }
 
   const managed = bambuNativeManagedPaths();
   const plugin = process.env.BAMBU_NATIVE_PLUGIN || managed.plugin;
@@ -454,9 +475,17 @@ function runNativeHelper(
         }
       }
     });
+    let cloudStderr = "";
+    const keepHelperErrors = (lines: string[]) => {
+      // Only the helper's own fatal-error lines; they never quote vendor output.
+      for (const line of lines) if (/^native_error=[^\x00-\x1f]{1,500}$/.test(line)) stderr = tail(`${stderr}${line}\n`);
+    };
     child.stderr.on("data", (chunk: Buffer) => {
       // Vendor diagnostics may contain account details or signed URLs.
-      if (!cloud) stderr = tail(stderr + chunk.toString("utf8"));
+      if (!cloud) { stderr = tail(stderr + chunk.toString("utf8")); return; }
+      const lines = (cloudStderr + chunk.toString("utf8")).split(/\r?\n/);
+      cloudStderr = (lines.pop() ?? "").slice(-1000);
+      keepHelperErrors(lines);
     });
     child.on("error", (error) => {
       // Node emits close after a spawn failure too. Keep one exit/cleanup path.
@@ -471,6 +500,7 @@ function runNativeHelper(
         reject(new Error("Native helper exited without completed dispatch authorization."));
         return;
       }
+      if (cloud) keepHelperErrors([cloudStderr]);
       const trailing = stdout.trim();
       if (trailing && !cloud) {
         updates.push(trailing);
@@ -479,6 +509,10 @@ function runNativeHelper(
       resolve({ resultCode: code ?? (signal ? 1 : 0), signal, authorizedAttempts, updates, stderr });
     });
   });
+}
+
+function helperErrors(result: NativeHelperResult): string[] {
+  return result.stderr.split("\n").filter(line => line.startsWith("native_error="));
 }
 
 const X2D_NATIVE_PRINT_COMMANDS = new Set([
@@ -886,7 +920,7 @@ export async function printWithBambuNative(
       throw new Error("Cloud printer capability report timed out before upload or dispatch; no job was submitted. Cloud login succeeded, but the selected printer did not finish its status handshake.");
     }
     if (cloud && result.authorizedAttempts > 0) {
-      throw new Error(`Bambu cloud print submission failed or is uncertain (helper ${result.resultCode}). Check the printer job and cloud history before any new submission; do not automatically resend or fall back to local printing. ${result.updates.filter(line => line.startsWith("native_print result=") || line.startsWith("native_cloud_failure ")).join("; ")}`);
+      throw new Error(`Bambu cloud print submission failed or is uncertain (helper ${result.resultCode}). Check the printer job and cloud history before any new submission; do not automatically resend or fall back to local printing. ${[...result.updates.filter(line => line.startsWith("native_print result=") || line.startsWith("native_cloud_failure ")), ...helperErrors(result)].join("; ")}`);
     }
     const explicitRejection = result.updates.some(line => /^native_print result=-?[1-9]\d*$/.test(line));
     if (result.authorizedAttempts > 0 && (result.updates.includes("native_print result=0") || (result.signal && !explicitRejection))) {
@@ -923,7 +957,10 @@ export async function probeBambuCloud(serial: string, signal?: AbortSignal) {
   return withStudioCloudSession(serial, signal, async cloudEnv => {
     const result = await runNativeHelper("--probe-cloud", { ...process.env, ...cloudEnv, BAMBU_NATIVE_SERIAL: serial }, 40_000, undefined, { signal });
     if (result.updates.includes("native_cloud_signing=rejected")) throw new Error("Cloud login succeeded, but the signed camera-URL check was rejected or timed out; no print was submitted.");
-    if (result.resultCode !== 0) throw new Error(`Native cloud connection check failed (helper ${result.resultCode}); no job was submitted.`);
+    if (result.resultCode !== 0) {
+      const detail = [...result.updates.filter(line => /^native_cloud_(?:session=missing|query |server |device=timeout)/.test(line)), ...helperErrors(result)];
+      throw new Error(`Native cloud connection check failed (helper ${result.resultCode}); no job was submitted.${detail.length ? ` ${detail.join("; ")}` : ""}`);
+    }
     if (!result.updates.includes("native_cloud_signing=verified")) throw new Error("Native cloud check did not verify signed authorization; rebuild the helper. No print was submitted.");
     const response = JSON.parse(await fs.promises.readFile(path.join(cloudEnv.BAMBU_NATIVE_CONFIG_DIR!, "cloud-probe-response.json"), "utf8"));
     const device = response.devices?.find((entry: any) => entry.dev_id === serial);

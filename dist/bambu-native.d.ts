@@ -88,6 +88,10 @@ export declare function bambuNativeManagedPaths(env?: NodeJS.ProcessEnv): {
 export declare const BAMBU_NATIVE_SOURCE: string;
 export declare function sha256Hex(data: Buffer | string): string;
 export declare function sha256File(file: string): string;
+/** Sources scripts/build-bambu-native.sh compiles and records beside the helper. */
+export declare const BAMBU_NATIVE_HELPER_SOURCES: readonly ["bambu-native-print.cpp", "bambu-cloud-identity.cpp"];
+/** True when the build receipt names exactly the current helper sources. */
+export declare function nativeHelperReceiptMatches(receiptFile: string, sourceDirectory: string): boolean;
 /**
  * Name the setup from this server's own version, whose helper source it
  * accepts, and its own install directory when that is not the default.

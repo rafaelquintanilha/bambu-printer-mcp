@@ -8,7 +8,7 @@ import {spawnSync} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
 import JSZip from 'jszip';
 import {decodeStudioSession, verifyCloudPrinter, withStudioCloudSession, cloudPrintMetadata} from '../dist/bambu-cloud.js';
-import {printWithBambuNative, probeBambuCloud} from '../dist/bambu-native.js';
+import {printWithBambuNative, probeBambuCloud, nativeHelperReceiptMatches, BAMBU_NATIVE_HELPER_SOURCES} from '../dist/bambu-native.js';
 
 const secret = 'PRIVATE_TEST_SESSION_1234567890';
 const hostPlatform = process.platform;
@@ -92,6 +92,38 @@ process.exit(${rejected?20:0});
   assert.equal(checks,2);
   assert(!updates.join('').includes(secret));
   assert.equal((await fs.readFile(events,'utf8')).trim().split('\n').length,1);
+});
+
+test('cloud failures show the helper error but no vendor diagnostics',async t=>{
+  const s=await setup(t);
+  const helper=path.join(s.directory,'helper.mjs');
+  await fs.writeFile(helper,`#!/usr/bin/env node
+if(process.argv[2]==='--probe-cloud'){console.log('native_cloud_session=missing');process.exit(1);}
+console.error('vendor diagnostic ${secret}');
+process.stderr.write('native_error=cloud connection failed before dispatch; no job was submitted\\n');
+process.exit(1);
+`,{mode:0o755});
+  process.env.BAMBU_NATIVE_HELPER=helper;process.env.BAMBU_NATIVE_PRINT_ROUTE='cloud';
+  await assert.rejects(printWithBambuNative({host:'127.0.0.1',serial:'20PTEST',token:'DUMMY',filePath:'/tmp/checked.3mf',projectName:'test',presetName:'test',plateIndex:0,bedType:'textured_plate',useAMS:true},undefined,{beforeDispatch:async()=>{}}),error=>{
+    assert.match(error.message,/native_error=cloud connection failed before dispatch/);
+    assert(!error.message.includes(secret));
+    return true;
+  });
+  await assert.rejects(probeBambuCloud('20PTEST'),/check failed \(helper 1\); no job was submitted\. native_cloud_session=missing/);
+});
+
+test('a package-local helper must match the current native sources',async t=>{
+  const directory=await fs.mkdtemp(path.join(os.tmpdir(),'helper-receipt-'));
+  t.after(()=>fs.rm(directory,{recursive:true,force:true}));
+  const {createHash}=await import('node:crypto');
+  const receipt=path.join(directory,'bambu-native-print-source.json');
+  const record={};
+  for(const name of BAMBU_NATIVE_HELPER_SOURCES){await fs.writeFile(path.join(directory,name),`source ${name}`);record[name]=createHash('sha256').update(`source ${name}`).digest('hex');}
+  assert.equal(nativeHelperReceiptMatches(receipt,directory),false,'a helper built before receipts existed is stale');
+  await fs.writeFile(receipt,JSON.stringify(record));
+  assert.equal(nativeHelperReceiptMatches(receipt,directory),true);
+  await fs.writeFile(path.join(directory,BAMBU_NATIVE_HELPER_SOURCES[0]),'changed source');
+  assert.equal(nativeHelperReceiptMatches(receipt,directory),false);
 });
 
 test('cloud mappings retain the checked left nozzle and gray AMS slot',async t=>{
