@@ -31,6 +31,16 @@ This file is the repository's shared source of truth for local agents (Claude Co
 - Package only intended runtime, source, licenses, and contributor files. Build MCPB in isolated staging without pruning the developer checkout. Never package credentials, local configuration, or private models.
 - Use a private OS temporary directory per server instance and distinct generated profile paths for differing content.
 
+## Using the connector with a printer
+
+- Preserve the printer's cloud pairing, Wi-Fi connection and Bambu Handy access. Never switch the printer to LAN Only or Developer Mode to make an integration work.
+- Look for saved work before downloading or slicing: `find_saved_prints` with the model name or MakerWorld URL, `get_saved_print_details` for an existing slice, and `list_printer_files` for printer storage. A saved MakerWorld item, an unsliced project, a prepared slice and a file on the printer are different states; do not treat one as another.
+- Reuse a prepared slice when it matches the requested model, quantity, scale, plate, nozzles and settings. Slice only when there is no printable G-code, the file is incompatible, or a change was requested, and say why first. Check the resulting process (layer height, filament) against the source project before preparing a review.
+- Agree on model, quantity and color before slicing. Uploading and starting a print are separate approvals: an upload request does not authorize printing, and approval for one job never carries over to another.
+- Report by evidence. A transfer is done only with its readback receipt; a print has started only when fresh status shows the dispatched `printerJobName` with layers rising, confirmed on camera. A dispatch receipt, a successful login or an uploaded file is not proof of printing.
+- When a transfer or start fails, name the failed step and code. Never replay an uncertain upload or print, and do not repeat a failed route without a concrete change that addresses the failure.
+- Keep personal accounts, local paths and printer identifiers out of this public repository; they belong in the user's private notes and configuration.
+
 ## Printer and slicer safety
 
 - All print routes must inspect the exact dispatched file snapshot and selected plate, enforce independent model/component and declared-material temperature ceilings, and require fresh observed MQTT identity, nozzle configuration, ready state, and actionable-error checks. Configured serial inference and cached display status are not live safety evidence.
