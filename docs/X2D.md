@@ -6,15 +6,14 @@
 
 | Work | Tools |
 | --- | --- |
-| Inspect and edit models | `get_stl_info`, `scale_stl`, `rotate_stl`, `extend_stl_base`, `merge_vertices`, `center_model`, `lay_flat` |
-| Create and edit complex geometry | The MCP client's existing Blender integration, or this server's optional `blender_mcp_status`, `blender_mcp_call` and `blender_mcp_edit_model` bridge |
-| Prepare a print | `get_slice_settings`, `list_templates`, `save_template`, `slice_with_template`, `slice_stl`, `list_3mf_plate_objects`, `inspect_print_file` |
+| Find saved work | `find_saved_prints`, `get_saved_print_details`, `save_makerworld_collection` |
+| Prepare a print | `slice_stl`, `get_slice_settings`, `list_3mf_plate_objects`, `inspect_print_file` |
 | Choose and manage filament | `get_printer_filaments`, `resolve_3mf_ams_slots`, `x2d_native_control`, `reread_ams_rfid`, `set_ams_drying` |
-| Send and print | `upload_file`, `prepare_print`, `confirm_print`, `print_3mf` (review alias), `list_printer_files`, `delete_printer_file` |
+| Send and print | `upload_file`, `prepare_print`, `confirm_print`, `list_printer_files`, `delete_printer_file` |
 | Monitor and control | `get_printer_status`, `camera_snapshot`, `pause_print`, `resume_print`, `cancel_print`, `clear_hms_errors`, `set_print_speed`, `set_temperature`, `set_fan_speed`, `set_airduct_mode`, `set_light`, `skip_objects` |
 | Inspect the connector and saved jobs | `get_connector_info`, `get_print_history` |
 
-Model creation uses Blender; the server's built-in mesh tools edit existing STL files. The optional Blender bridge needs its own configuration and a running Blender addon. See the upstream [setup guide](SETUP.md) for those requirements. No bridge is needed when the MCP client already has a Blender integration.
+The client sends every tool definition to the model on each turn, so this profile offers one tool per job. `slice_stl` scales, rotates, orients and places models on the bed while slicing, and `get_saved_print_details` reads STL files. The standalone STL editing tools, the template registry, the Blender bridge and the `print_3mf` alias of `prepare_print` are available only from the generic `bambu-printer-mcp` server. For new geometry, use the MCP client's own Blender integration.
 
 Status includes job identity, stage, progress, remaining minutes, current layer, temperatures and errors. Camera snapshots need `ffmpeg` and return an MCP image with separate capture metadata; image bytes are not repeated as text. Status is retrieved on request; continuous monitoring or notifications are the MCP client's responsibility.
 

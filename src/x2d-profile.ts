@@ -16,17 +16,19 @@ export function configureX2dEnvironment(env: NodeJS.ProcessEnv): void {
   });
 }
 
+// Each tool definition is sent to the model on every turn, so the profile keeps
+// one tool per job. slice_stl covers scaling, rotation, orientation and bed
+// placement, and get_saved_print_details reads STL files, so the STL editing
+// tools are left out; so are the template registry, Blender and print_3mf,
+// which duplicates prepare_print. The generic server keeps all of them.
 const TOOL_NAMES = new Set([
   "get_printer_status", "get_printer_filaments", "resolve_3mf_ams_slots",
   "list_3mf_plate_objects", "camera_snapshot", "list_printer_files",
-  "get_stl_info", "scale_stl", "rotate_stl", "extend_stl_base",
-  "merge_vertices", "center_model", "lay_flat",
-  "list_templates", "save_template", "get_slice_settings", "slice_with_template", "slice_stl",
-  "inspect_print_file", "upload_file", "print_3mf", "delete_printer_file",
+  "get_slice_settings", "slice_stl",
+  "inspect_print_file", "upload_file", "delete_printer_file",
   "pause_print", "resume_print", "cancel_print", "clear_hms_errors",
   "x2d_native_control", "reread_ams_rfid", "set_ams_drying",
   "set_print_speed", "set_temperature", "set_fan_speed", "set_airduct_mode", "set_light", "skip_objects",
-  "blender_mcp_status", "blender_mcp_call", "blender_mcp_edit_model",
 ]);
 
 const CONFIGURATION_FIELDS = new Set([
@@ -36,9 +38,12 @@ const CONFIGURATION_FIELDS = new Set([
   "slicer_type", "slicer_path", "ffmpeg_path", "print", "experimental",
 ]);
 
+/** Fields of the template registry and a duplicate alias, unused with the X2D profile. */
+const OMITTED_FIELDS = new Set(["template_name", "template_dir", "filament_profile"]);
+
 const READ_ONLY_TOOLS = new Set([
   "get_printer_status", "get_printer_filaments", "resolve_3mf_ams_slots", "list_3mf_plate_objects",
-  "list_printer_files", "get_stl_info", "list_templates", "get_slice_settings", "inspect_print_file",
+  "list_printer_files", "get_slice_settings", "inspect_print_file",
   "get_connector_info", "get_print_history",
   "find_saved_prints", "get_saved_print_details",
 ]);
@@ -51,7 +56,7 @@ const DESCRIPTIONS: Record<string, string> = {
   slice_with_template: "Slice an STL or 3MF for the X2D with a saved template and the configured Bambu Studio installation. Agree with the user on model, quantity and color and read the live filament inventory first. Does not upload or print.",
   upload_file: "Send a sliced file to X2D internal storage without starting a print, including while another job runs. Inspect every printable plate and live printer compatibility, use a unique name, then read back and verify all bytes and checksums before reporting success. Returns the actual internal path. Use prepare_print and confirm_print separately to start printing.",
   list_printer_files: "List model files in X2D internal storage through Bambu Studio's file service, including printer paths, byte sizes and timestamps. Does not start or change a print. External SD/USB files and logs are not included.",
-  print_3mf: "Prepare an X2D print review without uploading, heating or starting. Alias of prepare_print. Ask the user for model, quantity and color before slicing. Returns the exact job, selected spool colors, camera image and a one-use approval_id. Obtain the user's explicit approval, visually check the camera, then call confirm_print.",
+  prepare_print: "Prepare an X2D print review without uploading, heating or starting. Ask the user for model, quantity and color before slicing. Returns the exact job, selected spool colors, camera image and a one-use approval_id. Obtain the user's explicit approval, visually check the camera, then call confirm_print.",
 };
 
 /** Limit both discovery and invocation, including direct calls to unadvertised tools. */
@@ -93,7 +98,7 @@ export class X2dToolProfile {
       description: "Read a saved .3mf, .gcode or .stl into a compact report: source/prepared state, identity, plates, objects, colors, nozzles, support settings and estimates. Never slices. Optional check_printer_storage reads the internal listing and reports filename matches and byte-size agreement; this is not current checksum verification or proof of Handy visibility. Inspect the exact prepared file before upload. Does not upload or start a print.",
       inputSchema: { type: "object", properties: { file_path: { type: "string", minLength: 1 }, check_printer_storage: { type: "boolean", default: false }, include_preview: { type: "boolean", default: true, description: "Return the saved plate PNG as MCP image content when present, without slicing." } }, required: ["file_path"] },
     }, {
-      ...print, name: "prepare_print", description: DESCRIPTIONS.print_3mf,
+      ...print, name: "prepare_print",
     }, {
       name: "confirm_print",
       description: "Start exactly one prepared X2D job AFTER the user explicitly approves its model, quantity and selected colors in chat. Copy the user's affirmative reply verbatim; never infer consent from silence or from preparing a job. Visually inspect the returned camera image, or a newer camera_snapshot, and set plate_clear only if the whole plate is visibly clear; ask the user if obstructed or ambiguous. Approval expires in 10 minutes; camera must be under 2 minutes old. A token works once, including failed attempts. Rechecks file, printer, job, nozzles, errors and selected spool colors before native dispatch. Never automatically retry an uncertain dispatch; verify printerJobName in status and camera.",
@@ -112,17 +117,17 @@ export class X2dToolProfile {
     }];
     this.tools = upstreamTools.filter(tool => TOOL_NAMES.has(tool.name) || ["prepare_print", "confirm_print", "get_connector_info", "get_print_history", "save_makerworld_collection", "find_saved_prints", "get_saved_print_details"].includes(tool.name)).map(tool => {
       const original = tool.inputSchema.properties ?? {};
-      const properties = Object.fromEntries(Object.entries(original).filter(([name]) => !CONFIGURATION_FIELDS.has(name)));
+      const properties = Object.fromEntries(Object.entries(original).filter(([name]) => !CONFIGURATION_FIELDS.has(name) && !OMITTED_FIELDS.has(name)));
       if (tool.name === "get_printer_status") properties.include_raw = { type: "boolean", default: false, description: "Include full MQTT telemetry for diagnosis; normally omit to keep responses compact." };
       const defaults: Record<string, unknown> = {};
       if (Object.prototype.hasOwnProperty.call(original, "bambu_model")) defaults.bambu_model = "x2d";
       if (Object.prototype.hasOwnProperty.call(original, "slicer_type")) defaults.slicer_type = "bambustudio";
       if (tool.name === "upload_file") Object.assign(defaults, { connection_mode: "bambu_native", print: false });
-      if (tool.name === "print_3mf" || tool.name === "prepare_print") defaults.connection_mode = "bambu_native";
+      if (tool.name === "prepare_print") defaults.connection_mode = "bambu_native";
       const inputSchema: Tool["inputSchema"] = {
         ...tool.inputSchema,
         properties,
-        required: (tool.inputSchema.required ?? []).filter(name => !CONFIGURATION_FIELDS.has(name)),
+        required: (tool.inputSchema.required ?? []).filter(name => !CONFIGURATION_FIELDS.has(name) && !OMITTED_FIELDS.has(name)),
         additionalProperties: false,
       };
       this.defaults.set(tool.name, defaults);

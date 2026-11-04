@@ -1944,7 +1944,7 @@ class BambuPrinterMCPServer {
     args: Record<string, any>, host: string, bambuSerial: string, bambuToken: string,
     onUpdate?: BambuNativeUpdateCallback, signal?: AbortSignal
   ): Promise<Record<string, unknown>> {
-    if (args.print) throw new Error("Native upload never starts printing; use print_3mf.");
+    if (args.print) throw new Error(`Native upload never starts printing; use ${X2D_PROFILE ? "prepare_print" : "print_3mf"}.`);
     // Resolve and enforce the model first, as the print path does, so a
     // non-X2D request is never told to install the native helper.
     const model = await this.resolveBambuModel(args.bambu_model);
@@ -1953,7 +1953,7 @@ class BambuPrinterMCPServer {
     const unsupported = ["use_ams", "ams_mapping", "ams_mapping2", "ams_mapping_info", "nozzle_mapping", "nozzles_info",
       "bed_leveling", "flow_calibration", "vibration_calibration", "layer_inspect", "timelapse"];
     for (const key of unsupported) {
-      if (args[key] !== undefined) throw new Error(`${key} is not supported for native upload-only requests; use print_3mf for checked print settings.`);
+      if (args[key] !== undefined) throw new Error(`${key} is not supported for native upload-only requests; use ${X2D_PROFILE ? "prepare_print" : "print_3mf"} for checked print settings.`);
     }
     for (const key of ["project_name", "preset_name"]) {
       if (args[key] !== undefined && (typeof args[key] !== "string" || !args[key].trim())) {

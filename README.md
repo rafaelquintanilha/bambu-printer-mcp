@@ -1,6 +1,6 @@
 # bambu-printer-mcp
 
-This fork adds **`bambu-x2d-mcp`**, a local X2D workflow for MCP clients: model editing, Bambu Studio slicing, AMS management, upload, printing and monitoring. Its `prepare_print` (also named `print_3mf`) returns a job review and camera image; `confirm_print` requires explicit chat approval and visual plate clearance before dispatch. See the [X2D setup and tool guide](docs/X2D.md). The upstream executable and its safety checks remain available.
+This fork adds **`bambu-x2d-mcp`**, a local X2D workflow for MCP clients: finding saved models, Bambu Studio slicing, AMS management, upload, printing and monitoring. Its `prepare_print` returns a job review and camera image; `confirm_print` requires explicit chat approval and visual plate clearance before dispatch. See the [X2D setup and tool guide](docs/X2D.md). The upstream executable and its safety checks remain available.
 
 The X2D profile also provides compact status with telemetry age, persistent observed-job history, native camera images and running-build diagnostics. `get_print_history` reads saved observations; `get_connector_info` identifies the loaded build and whether it needs restarting. These tools use Node.js 24 and do not authorize or start a print.
 

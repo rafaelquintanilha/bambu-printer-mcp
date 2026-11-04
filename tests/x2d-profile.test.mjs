@@ -105,8 +105,15 @@ test("X2D stdio entry advertises the complete local workflow without credential 
   const s = await server(t);
   assert.equal(s.client.getServerVersion().name,"bambu-x2d-mcp");
   const {tools} = await s.client.listTools();
-  for (const name of ["get_connector_info","get_print_history","get_printer_status","get_printer_filaments","camera_snapshot","slice_stl","get_slice_settings","inspect_print_file","upload_file","print_3mf","prepare_print","confirm_print","pause_print","cancel_print","x2d_native_control","scale_stl","blender_mcp_call"]) {
+  for (const name of ["get_connector_info","get_print_history","get_printer_status","get_printer_filaments","camera_snapshot","slice_stl","get_slice_settings","inspect_print_file","upload_file","prepare_print","confirm_print","pause_print","cancel_print","x2d_native_control","get_saved_print_details"]) {
     assert(tools.some(tool=>tool.name===name),name);
+  }
+  // One tool per job: duplicates and workflows covered by other tools stay in the generic server only.
+  for (const name of ["print_3mf","slice_with_template","list_templates","save_template","scale_stl","rotate_stl","lay_flat","center_model","get_stl_info","extend_stl_base","merge_vertices","blender_mcp_status","blender_mcp_call","blender_mcp_edit_model"]) {
+    assert.equal(tools.some(tool=>tool.name===name),false,name);
+  }
+  for (const tool of tools) for (const field of ["template_name","template_dir","filament_profile"]) {
+    assert.equal(Object.hasOwn(tool.inputSchema.properties,field),false,`${tool.name}.${field}`);
   }
   for (const tool of tools) {
     assert.equal(tool.inputSchema.additionalProperties,false);
@@ -132,7 +139,9 @@ test("X2D rejects hidden tools, credentials, wrong models and invalid types befo
     ["inspect_print_file",{file_path:s.file,bambu_model:"a1"}],
     ["slice_stl",{stl_path:sampleStl,slicer_path:"/bin/echo"}],
     ["scale_stl",{stl_path:sampleStl,scale_x:"2"}],
-    ["print_3mf",{three_mf_path:s.file,use_ams:"false"}],
+    ["print_3mf",{three_mf_path:s.file,ams_slots:[0]}],
+    ["prepare_print",{three_mf_path:s.file,use_ams:"false"}],
+    ["slice_stl",{stl_path:sampleStl,template_name:"saved"}],
   ]) await assert.rejects(s.call(name,args), /Invalid.*arguments|not available/);
   await assert.rejects(s.client.readResource({uri:"printer://203.0.113.1/status"}),/configured printer/);
   assert.deepEqual(await s.events(),[]);
@@ -200,8 +209,8 @@ test('X2D raw status is explicit and the status resource stays compact',async t=
 
 test("X2D local model and sliced-file inspection need no printer connection or model argument", async t => {
   const s = await server(t);
-  const model = await s.call("get_stl_info",{stl_path:sampleStl});
-  assert.notEqual(model.isError,true);
+  const model = await s.call("get_saved_print_details",{file_path:sampleStl});
+  assert.notEqual(model.isError,true,JSON.stringify(model));
   const slice = await s.call("inspect_print_file",{file_path:s.file});
   assert.notEqual(slice.isError,true,JSON.stringify(slice));
   assert.equal(slice.structuredContent.inspection.model,"x2d");
@@ -250,9 +259,9 @@ test("X2D saved library persists observed collections and finds existing files w
   await assert.rejects(s.call('find_saved_prints',{query:'badge',host:'203.0.113.1'}),/Invalid.*arguments/);
 });
 
-test("X2D print_3mf only prepares a review even when inherited configuration disables confirmation", async t => {
+test("X2D prepare_print only prepares a review even when inherited configuration disables confirmation", async t => {
   const s = await server(t,{confirmation:false});
-  const result = await s.call("print_3mf",{three_mf_path:s.file,ams_slots:[0]});
+  const result = await s.call("prepare_print",{three_mf_path:s.file,ams_slots:[0]});
   assert.notEqual(result.isError,true,JSON.stringify(result));
   assert.equal(result.structuredContent.status,'awaiting_confirmation');
   assert.equal(result.structuredContent.printRequested,false);
@@ -377,7 +386,7 @@ test("X2D concurrent confirms can dispatch a reviewed job only once",async t=>{
 
 test("X2D print still refuses a busy printer before dispatch", async t => {
   const s = await server(t,{printing:true});
-  const result = await s.call("print_3mf",{three_mf_path:s.file,ams_slots:[0]});
+  const result = await s.call("prepare_print",{three_mf_path:s.file,ams_slots:[0]});
   assert.equal(result.isError,true);
   assert.match(result.content[0].text,/RUNNING|idle/);
   assert.equal((await s.events()).some(e=>e.mode.startsWith("--")),false);
