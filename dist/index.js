@@ -2958,6 +2958,8 @@ class BambuPrinterMCPServer {
                             features: { compact_status: true, camera_image_content: true, chat_print_review: true, persistent_job_history: true, internal_file_listing: true, upload_readback_verification: true, saved_print_library: true },
                             native_transport: { local_prerequisites_available: unavailable === undefined, reason: unavailable ?? null, signing: "not_checked", physical_print: "not_checked" },
                             print_route: process.env.BAMBU_NATIVE_PRINT_ROUTE || "local",
+                            // Pause, resume, stop and other native controls follow the print route.
+                            control_route: process.env.BAMBU_NATIVE_PRINT_ROUTE === "cloud" ? "cloud" : "local",
                             cloud_transport: args?.check_connections === true ? await probeBambuCloud(bambuSerial, extra.signal).catch(error => ({ status: "unavailable", message: error.message })) : { configured: !!process.env.BAMBU_CLOUD_STUDIO_DIR, authentication: "not_checked", submission: "not_checked" },
                             local_storage: args?.check_connections === true ? await listInternalPrinterFiles({ host, token: bambuToken }, { signal: extra.signal }).then(files => ({ status: "available", file_count: files.entries.length, checked_at: new Date().toISOString() })).catch(error => ({ status: "unavailable", message: error.message, ...(error instanceof BambuFileServiceError ? error.details() : {}) })) : { status: "not_checked" },
                             job_history: { directory: this.stateDirectory, retained_jobs_per_printer: 100, refresh: "get_printer_status or status resource; no background scheduler" },

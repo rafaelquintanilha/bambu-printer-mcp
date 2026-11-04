@@ -1,6 +1,7 @@
 #include <dlfcn.h>
 
 #include <algorithm>
+#include <cctype>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -524,15 +525,64 @@ enum class NativeOperation {
     Upload,
     Command,
     AuthorizedCommand,
+    CloudCommand,
+    CloudAuthorizedCommand,
 };
 
-void *createCloudAgent(const NativeApi &api);
+void *createCloudAgent(const NativeApi &api, std::function<void(const std::string &)> observe = {});
+
+// The printer answers each control on its report topic with the request's
+// sequence_id and a result. Only this reply shows that the printer accepted it;
+// a successful publish does not.
+struct CommandReply {
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::string sequence;
+    std::string command;
+    bool resolved = false;
+    std::string result;
+    std::string reason;
+    std::string errorCode;
+};
+
+std::string jsonStringField(const std::string &json, const char *key) {
+    const std::regex field(std::string("\"") + key + R"re("\s*:\s*"([^"\\]{0,200})")re");
+    std::smatch match;
+    return std::regex_search(json, match, field) ? match[1].str() : std::string{};
+}
+
+std::string replyToken(const std::string &value, std::size_t limit) {
+    std::string token;
+    for (const char c : value.substr(0, limit)) token += std::isalnum(static_cast<unsigned char>(c)) || c == '.' || c == '-' ? c : '_';
+    return token;
+}
+
+void observeCommandReply(const std::shared_ptr<CommandReply> &reply, const std::string &message) {
+    if (reply->sequence.empty() || message.find(reply->sequence) == std::string::npos) return;
+    static const std::regex sequenceField(R"re("sequence_id"\s*:\s*"?([^",}\s]{1,64}))re");
+    std::smatch sequence;
+    if (!std::regex_search(message, sequence, sequenceField) || sequence[1].str() != reply->sequence ||
+        jsonStringField(message, "command") != reply->command) return;
+    const std::string result = jsonStringField(message, "result");
+    if (result.empty()) return;
+    std::smatch code;
+    static const std::regex errorCode(R"re("err_code"\s*:\s*"?(-?\d{1,12})"?)re");
+    std::lock_guard<std::mutex> lock(reply->mutex);
+    if (reply->resolved) return;
+    reply->resolved = true;
+    reply->result = replyToken(result, 20);
+    reply->reason = replyToken(jsonStringField(message, "reason"), 80);
+    if (std::regex_search(message, code, errorCode)) reply->errorCode = code[1].str();
+    reply->cv.notify_all();
+}
 
 void runOperation(NativeApi &api, NativeOperation operation) {
-    const bool cloud = operation == NativeOperation::CloudPrint;
+    const bool cloudCommand = operation == NativeOperation::CloudCommand || operation == NativeOperation::CloudAuthorizedCommand;
+    const bool cloud = operation == NativeOperation::CloudPrint || cloudCommand;
     const bool uploadOnly = operation == NativeOperation::Upload;
-    const bool commandOnly = operation == NativeOperation::Command || operation == NativeOperation::AuthorizedCommand;
-    const bool needsAuthorization = operation == NativeOperation::Print || cloud || operation == NativeOperation::AuthorizedCommand;
+    const bool commandOnly = operation == NativeOperation::Command || operation == NativeOperation::AuthorizedCommand || cloudCommand;
+    const bool needsAuthorization = operation == NativeOperation::Print || operation == NativeOperation::CloudPrint ||
+                                    operation == NativeOperation::AuthorizedCommand || operation == NativeOperation::CloudAuthorizedCommand;
     const char *confirmation = commandOnly ? "BAMBU_NATIVE_COMMAND_CONFIRM" :
                                uploadOnly ? "BAMBU_NATIVE_UPLOAD_CONFIRM" : "BAMBU_NATIVE_CONFIRM";
     if (envOr(confirmation) != "1") {
@@ -564,7 +614,13 @@ void runOperation(NativeApi &api, NativeOperation operation) {
     const std::string certFile = envOr("BAMBU_NATIVE_CERT_FILE", "slicer_base64.cer");
     const std::string country = envOr("BAMBU_NATIVE_COUNTRY", "US");
 
-    void *agent = cloud ? createCloudAgent(api) : api.createAgent(configDir);
+    auto reply = std::make_shared<CommandReply>();
+    if (cloudCommand) {
+        reply->sequence = jsonStringField(commandJson, "sequence_id");
+        reply->command = jsonStringField(commandJson, "command");
+    }
+    void *agent = cloud ? createCloudAgent(api, cloudCommand ? std::function<void(const std::string &)>(
+        [reply](const std::string &message) { observeCommandReply(reply, message); }) : nullptr) : api.createAgent(configDir);
     if (!agent) throw std::runtime_error("bambu_network_create_agent returned null");
     const auto destroyAgent = [&]() { api.destroyAgent(agent); };
 
@@ -583,6 +639,45 @@ void runOperation(NativeApi &api, NativeOperation operation) {
     };
 
     int result = 0;
+    if (cloudCommand) {
+        // Local control publishes are not signed by the plug-in (it returns -4
+        // for print.* commands), so controls follow the signed cloud session
+        // that prints use. The parent never replays a control.
+        const auto send = requiredSymbol<SendMessageToPrinterFn>(api.handle, "bambu_network_send_message");
+        const int qos = std::clamp(intEnv("BAMBU_NATIVE_COMMAND_QOS", 0), 0, 1);
+        const int flag = std::clamp(intEnv("BAMBU_NATIVE_COMMAND_FLAG", 0), 0, 1);
+        authorizeDispatch(1);
+        result = send(agent, serial, commandJson, qos, flag);
+        outputLine("native_command result=" + std::to_string(result));
+        if (result == -2) {
+            // Studio's first signed publish to a printer fails the same way: the
+            // plug-in then installs its app certificate on the printer, and the
+            // next publish is signed. -2 is returned before publishing, so a
+            // retry cannot duplicate the command; each one is re-authorized.
+            api.installDeviceCert(agent, serial, false);
+            const int attempts = std::clamp(intEnv("BAMBU_NATIVE_CLOUD_CERT_ATTEMPTS", 8), 1, 20);
+            for (int attempt = 2; attempt <= attempts + 1 && result == -2; ++attempt) {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+                authorizeDispatch(attempt);
+                result = send(agent, serial, commandJson, qos, flag);
+                outputLine("native_command result=" + std::to_string(result));
+            }
+        }
+        // As with cloud prints, skip plug-in teardown, which can crash after a send.
+        if (result != 0) exitNow(20);
+        std::unique_lock<std::mutex> lock(reply->mutex);
+        const auto wait = std::chrono::seconds(std::clamp(intEnv("BAMBU_NATIVE_COMMAND_REPLY_SECONDS", 10), 1, 30));
+        if (reply->sequence.empty() || !reply->cv.wait_for(lock, wait, [&reply]() { return reply->resolved; })) {
+            outputLine("native_command_reply=none");
+            exitNow(0);
+        }
+        std::string accepted = reply->result;
+        std::transform(accepted.begin(), accepted.end(), accepted.begin(), [](unsigned char c) { return std::tolower(c); });
+        outputLine("native_command_reply result=" + reply->result +
+                   (reply->reason.empty() ? std::string{} : " reason=" + reply->reason) +
+                   (reply->errorCode.empty() ? std::string{} : " err_code=" + reply->errorCode));
+        exitNow(accepted == "success" ? 0 : 21);
+    }
     if (!cloud) {
     result = api.setConfigDir(agent, configDir);
     if (result != 0) { destroyAgent(); throw std::runtime_error("set_config_dir failed: " + std::to_string(result)); }
@@ -958,7 +1053,7 @@ void runPluginCheck(const NativeApi &) {
 // The caller supplies a private copy of its authenticated configuration; this
 // probe never uploads, dispatches a job, or changes the Studio session.
 namespace {
-void *createCloudAgent(const NativeApi &api) {
+void *createCloudAgent(const NativeApi &api, std::function<void(const std::string &)> observe) {
     const auto loggedIn = requiredSymbol<bool (*)(void *)>(api.handle, "bambu_network_is_user_login");
     const std::string directory = envOr("BAMBU_NATIVE_CONFIG_DIR");
     const std::string serial = envOr("BAMBU_NATIVE_SERIAL");
@@ -991,8 +1086,9 @@ void *createCloudAgent(const NativeApi &api) {
         outputLine("native_cloud_capability_request=" + std::to_string(result));
         api.installDeviceCert(agent, serial, false);
     }), "printer callback");
-    check(api.setMessage(agent, [capabilities, serial, agent, &api](std::string devId, std::string message) {
+    check(api.setMessage(agent, [capabilities, serial, agent, observe, &api](std::string devId, std::string message) {
         if ((devId.empty() || devId == serial) && message == "wait_info") api.installDeviceCert(agent, serial, false);
+        if (observe && devId == serial) observe(message);
         // The plug-in parses the device security flags from this same report.
         // This is a readiness signal, not a replacement for the parent's
         // independent fresh identity, hardware and job checks at dispatch.
@@ -1077,12 +1173,15 @@ int main(int argc, char **argv) {
         const bool upload = argc == 2 && std::strcmp(argv[1], "--upload") == 0;
         const bool command = argc == 2 && std::strcmp(argv[1], "--command") == 0;
         const bool authorizedCommand = argc == 2 && std::strcmp(argv[1], "--command-authorized") == 0;
-        if (!pluginCheck && !probe && !mqttProbe && !cloudProbe && !print && !cloudPrint && !upload && !command && !authorizedCommand) {
-            std::cerr << "usage: bambu-native-print --check-plugin|--probe|--probe-mqtt|--print-authorized|--upload|--command|--command-authorized" << std::endl;
+        const bool cloudCommand = argc == 2 && std::strcmp(argv[1], "--cloud-command") == 0;
+        const bool cloudAuthorizedCommand = argc == 2 && std::strcmp(argv[1], "--cloud-command-authorized") == 0;
+        if (!pluginCheck && !probe && !mqttProbe && !cloudProbe && !print && !cloudPrint && !upload && !command && !authorizedCommand &&
+            !cloudCommand && !cloudAuthorizedCommand) {
+            std::cerr << "usage: bambu-native-print --check-plugin|--probe|--probe-mqtt|--print-authorized|--upload|--command|--command-authorized|--cloud-command|--cloud-command-authorized" << std::endl;
             return 2;
         }
 #if defined(__APPLE__)
-        if (cloudProbe || cloudPrint) configureCloudIdentity(
+        if (cloudProbe || cloudPrint || cloudCommand || cloudAuthorizedCommand) configureCloudIdentity(
             envOr("SLICER_PATH", "/Applications/BambuStudio.app/Contents/MacOS/BambuStudio"),
             envOr("BAMBU_NATIVE_PLUGIN", defaultPluginPath()));
 #endif
@@ -1096,6 +1195,8 @@ int main(int argc, char **argv) {
         if (upload) runOperation(api, NativeOperation::Upload);
         if (command) runOperation(api, NativeOperation::Command);
         if (authorizedCommand) runOperation(api, NativeOperation::AuthorizedCommand);
+        if (cloudCommand) runOperation(api, NativeOperation::CloudCommand);
+        if (cloudAuthorizedCommand) runOperation(api, NativeOperation::CloudAuthorizedCommand);
         exitNow(0);
     } catch (const std::exception &error) {
         std::cerr << "native_error=" << error.what() << std::endl;

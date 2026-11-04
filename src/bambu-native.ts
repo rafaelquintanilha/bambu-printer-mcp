@@ -370,7 +370,8 @@ export async function interruptNativeOperations(serial: string): Promise<void> {
 }
 
 function runNativeHelper(
-  mode: "--probe" | "--probe-cloud" | "--print-authorized" | "--cloud-print-authorized" | "--upload" | "--command" | "--command-authorized",
+  mode: "--probe" | "--probe-cloud" | "--print-authorized" | "--cloud-print-authorized" | "--upload" | "--command" | "--command-authorized" |
+    "--cloud-command" | "--cloud-command-authorized",
   env: NodeJS.ProcessEnv,
   timeoutMs: number,
   onUpdate?: BambuNativeUpdateCallback,
@@ -378,8 +379,10 @@ function runNativeHelper(
 ): Promise<NativeHelperResult> {
   execution.signal?.throwIfAborted();
   execution.assertActive?.();
-  const cloud = mode === "--cloud-print-authorized" || mode === "--probe-cloud";
-  const needsAuthorization = mode === "--print-authorized" || mode === "--cloud-print-authorized" || mode === "--command-authorized";
+  const commandMode = mode === "--command" || mode === "--command-authorized" || mode === "--cloud-command" || mode === "--cloud-command-authorized";
+  const cloud = mode === "--cloud-print-authorized" || mode === "--probe-cloud" || mode === "--cloud-command" || mode === "--cloud-command-authorized";
+  const needsAuthorization = mode === "--print-authorized" || mode === "--cloud-print-authorized" || mode === "--command-authorized" ||
+    mode === "--cloud-command-authorized";
   if (needsAuthorization && typeof execution.beforeDispatch !== "function") {
     throw new Error("Native dispatch requires a beforeDispatch fresh-state check.");
   }
@@ -427,7 +430,7 @@ function runNativeHelper(
     };
     activeHelpers.set(child, {
       serial: env.BAMBU_NATIVE_SERIAL || "",
-      emergency: (mode === "--command" || mode === "--command-authorized") && isEmergencyCommand(env.BAMBU_NATIVE_COMMAND_JSON || "{}"),
+      emergency: commandMode && isEmergencyCommand(env.BAMBU_NATIVE_COMMAND_JSON || "{}"),
       closed,
       interrupt: () => stop(interrupted("Native operation cancelled by stop or heater-off.")),
     });
@@ -469,7 +472,7 @@ function runNativeHelper(
             void authorizeDispatch(trimmed);
             continue;
           }
-          if (cloud && !/^native_(?:cloud_(?:session|server|query)|cloud_signing=(?:verified|rejected)$|cloud_device=(?:ready|timeout)$|cloud_capability_request=-?\d+$|cloud_failure status=-?\d+ code=-?\d+ step=[a-z0-9_]+(?: detail=-?\d+)?(?: http=-?\d+)?$|update status=\d+ code=-?\d+$|print result=-?\d+$)/.test(trimmed)) continue;
+          if (cloud && !/^native_(?:cloud_(?:session|server|query)|cloud_signing=(?:verified|rejected)$|cloud_device=(?:ready|timeout)$|cloud_capability_request=-?\d+$|cloud_failure status=-?\d+ code=-?\d+ step=[a-z0-9_]+(?: detail=-?\d+)?(?: http=-?\d+)?$|update status=\d+ code=-?\d+$|print result=-?\d+$|command result=-?\d+$|command_reply=none$|command_reply result=[A-Za-z0-9_.-]{1,20}(?: reason=[A-Za-z0-9_.-]{1,80})?(?: err_code=-?\d{1,12})?$)/.test(trimmed)) continue;
           updates.push(trimmed);
           onUpdate?.(trimmed);
         }
@@ -819,8 +822,12 @@ export async function sendCommandWithBambuNative(options: BambuNativeControlOpti
     throw new Error("X2D native control qos and flag must be 0 or 1.");
   }
 
-  const result = await runNativeHelper(
-    execution?.beforeDispatch ? "--command-authorized" : "--command",
+  // Local control publishes are not signed by the plug-in (print.* returns -4),
+  // so with the cloud print route, controls use that same signed session.
+  const cloud = process.env.BAMBU_NATIVE_PRINT_ROUTE === "cloud";
+  const authorized = typeof execution?.beforeDispatch === "function";
+  const dispatch = (cloudEnv: NodeJS.ProcessEnv = {}) => runNativeHelper(
+    cloud ? (authorized ? "--cloud-command-authorized" : "--cloud-command") : (authorized ? "--command-authorized" : "--command"),
     {
       ...process.env,
       BAMBU_NATIVE_COMMAND_CONFIRM: "1",
@@ -830,24 +837,37 @@ export async function sendCommandWithBambuNative(options: BambuNativeControlOpti
       BAMBU_NATIVE_COMMAND_JSON: validated.messageJson,
       BAMBU_NATIVE_COMMAND_QOS: String(qos),
       BAMBU_NATIVE_COMMAND_FLAG: String(flag),
+      ...cloudEnv,
     },
-    30_000,
+    cloud ? 60_000 : 30_000,
     undefined,
     execution
   );
+  const result = cloud ? await withStudioCloudSession(options.serial, execution?.signal, dispatch) : await dispatch();
+  const reply = result.updates.find(line => line.startsWith("native_command_reply"));
   if (result.resultCode !== 0) {
+    if (cloud && reply?.startsWith("native_command_reply result=")) {
+      throw new Error(`The printer rejected ${validated.command}: ${reply.slice("native_command_reply ".length)}. Check printer status before trying again.`);
+    }
     const detail = [
       ...result.updates,
-      ...(result.stderr ? [result.stderr.trim()] : []),
+      ...(cloud ? helperErrors(result) : result.stderr ? [result.stderr.trim()] : []),
     ]
-      .filter((line) => line.startsWith("native_error=") || line.startsWith("native_command result=") || line.startsWith("local MQTT connection"))
+      .filter((line) => /^(?:native_error=|native_command result=|native_cloud_(?:session=missing|server |device=timeout)|local MQTT connection)/.test(line))
       .join("; ");
-    throw new Error(`Bambu native X2D control failed (${result.resultCode})${detail ? `: ${detail}` : "."}`);
+    const sent = result.updates.includes("native_command result=0");
+    throw new Error(`Bambu native X2D ${cloud ? "cloud " : ""}control failed (${result.resultCode})${detail ? `: ${detail}` : "."}` +
+      (sent ? " The command may have reached the printer; check its status before retrying." : ""));
   }
   return {
     status: "success",
-    route: "bambu:///local",
+    route: cloud ? "bambu-cloud" : "bambu:///local",
     command: validated.command,
+    ...(cloud ? {
+      printer_reply: reply === "native_command_reply=none" || !reply
+        ? "none: sent, but the printer did not answer within the wait; check status"
+        : "accepted",
+    } : {}),
     updates: result.updates,
   };
 }

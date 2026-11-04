@@ -115,6 +115,8 @@ Cloud printing uses the same inspected file snapshot, AMS/nozzle checks, chat ap
 
 The cloud connection check also requests a protected camera URL and reports `signed_camera_authorization: verified` only for a successful URL response. Camera credentials are discarded. This checks the cloud signing gate independently of account login; it still does not prove print submission or physical delivery.
 
+With the cloud route, pause, resume, stop, heater-off and the other native controls use the same signed cloud session, because the plug-in does not sign local `print.*` commands. The first control to a printer can take a few extra seconds: the plug-in installs its app certificate on the printer, and the helper retries once that is done. Each retry re-runs the fresh-state checks, and none follows a publish that the plug-in accepted. The result reports the printer's own reply (`printer_reply: accepted`). A rejection is an error that includes the printer's reason. A missing reply is reported as unconfirmed; check `get_printer_status` before acting again. A cloud control takes about 10 seconds and needs internet access; when the cloud is unreachable, use the printer screen or Bambu Handy.
+
 `upload_file` remains a local, file-only operation. Cloud print submission can start a physical job and is never used as an upload-only fallback. A failed local connection reports whether the upload began; an unverified file can remain after an interrupted upload. Cloud pairing, Wi-Fi and Handy access do not need to change.
 
 ### Recovering a file connection

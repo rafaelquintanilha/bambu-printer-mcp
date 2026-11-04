@@ -8,7 +8,7 @@ import {spawnSync} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
 import JSZip from 'jszip';
 import {decodeStudioSession, verifyCloudPrinter, withStudioCloudSession, cloudPrintMetadata} from '../dist/bambu-cloud.js';
-import {printWithBambuNative, probeBambuCloud, nativeHelperReceiptMatches, BAMBU_NATIVE_HELPER_SOURCES} from '../dist/bambu-native.js';
+import {printWithBambuNative, probeBambuCloud, nativeHelperReceiptMatches, BAMBU_NATIVE_HELPER_SOURCES, sendCommandWithBambuNative} from '../dist/bambu-native.js';
 
 const secret = 'PRIVATE_TEST_SESSION_1234567890';
 const hostPlatform = process.platform;
@@ -261,4 +261,96 @@ int main() {
   checks=0;
   assert.equal((await printWithBambuNative(options,undefined,{beforeDispatch:async()=>{checks++;}})).route,'bambu-cloud');
   assert.equal(checks,2);assert.equal(await fs.readFile(receipt,'utf8'),'submitted');
+});
+
+test('compiled cloud control retries the certificate bootstrap, re-authorizes each attempt and reports the printer reply',async t=>{
+  const s=await setup(t), source=fileURLToPath(new URL('../native/bambu-native-print.cpp',import.meta.url));
+  const driver=path.join(s.directory,'control-driver.cpp'), binary=path.join(s.directory,'control-native'), sends=path.join(s.directory,'sends');
+  await fs.writeFile(driver,`
+#define main unused_native_main
+#include ${JSON.stringify(source)}
+#undef main
+std::function<void(int,int)> cloudConnected;
+std::function<void(std::string,std::string)> cloudMessage;
+std::function<void(std::string)> printerConnected;
+std::string selected;
+int commandFailures=0;
+bool certificateInstalled=false;
+extern "C" bool bambu_network_is_user_login(void*) { return true; }
+extern "C" int bambu_network_set_extra_http_header(void*, std::map<std::string,std::string>) { return 0; }
+extern "C" int bambu_network_set_on_server_connected_fn(void*,std::function<void(int,int)> fn) { cloudConnected=fn; return 0; }
+extern "C" int bambu_network_connect_server(void*) { cloudConnected(0,0); return 0; }
+extern "C" int bambu_network_set_user_selected_machine(void*,std::string serial) { selected=serial; return 0; }
+extern "C" int bambu_network_add_subscribe(void*,std::vector<std::string>) { return 0; }
+extern "C" int bambu_network_start_subscribe(void*,std::string) { printerConnected(selected); return 0; }
+extern "C" int bambu_network_send_message(void*,std::string serial,std::string message,int qos,int) {
+  if(message.find("pushall")!=std::string::npos) { cloudMessage(serial,R"({"print":{"fun":"1234"}})"); return 0; }
+  { std::ofstream log(envOr("TEST_SENDS"),std::ios::app); log<<message<<"\\n"; }
+  // Like the plug-in: the first signed publish fails until the app certificate is installed.
+  if(!certificateInstalled) { commandFailures++; return -2; }
+  if(qos!=1) return -9;
+  const std::string reply=envOr("TEST_REPLY"), command=jsonStringField(message,"command"), sequence=jsonStringField(message,"sequence_id");
+  cloudMessage(serial,R"({"print":{"command":"push_status","sequence_id":")"+sequence+R"(","result":"failed"}})");
+  if(reply=="success") cloudMessage(serial,R"({"print":{"command":")"+command+R"(","sequence_id":")"+sequence+R"(","result":"success","reason":"","err_code":0}})");
+  if(reply=="failed") cloudMessage(serial,R"({"print":{"command":")"+command+R"(","sequence_id":")"+sequence+R"(","result":"failed","reason":"mqtt message verify failed","err_code":84033543}})");
+  return 0;
+}
+int main() {
+  NativeApi api;
+  api.handle=dlopen(nullptr,RTLD_NOW|RTLD_GLOBAL);
+  api.createAgent=[](std::string)->void*{return reinterpret_cast<void*>(1);};
+  api.destroyAgent=[](void*){return 0;};
+  api.setConfigDir=[](void*,std::string){return 0;};
+  api.initLog=[](void*){return 0;};
+  api.setCertFile=[](void*,std::string,std::string){return 0;};
+  api.setCountryCode=[](void*,std::string){return 0;};
+  api.setQueueOnMain=[](void*,std::function<void(std::function<void()>)>){return 0;};
+  api.setMessage=[](void*,std::function<void(std::string,std::string)> fn){cloudMessage=fn;return 0;};
+  api.setPrinterConnected=[](void*,std::function<void(std::string)> fn){printerConnected=fn;return 0;};
+  api.installDeviceCert=[](void*,std::string,bool lanOnly){if(lanOnly)std::abort();if(commandFailures)certificateInstalled=true;};
+  api.updateCert=[](void*){return 0;};
+  api.start=[](void*){return 0;};
+  api.connectPrinter=[](void*,std::string,std::string,std::string,std::string,bool){std::abort();return -1;};
+  api.startLocalPrint=[](void*,BBL::PrintParams,BBL::OnUpdateStatusFn,BBL::WasCancelledFn){std::abort();return -1;};
+  try { runOperation(api,envOr("TEST_AUTHORIZED")=="1"?NativeOperation::CloudAuthorizedCommand:NativeOperation::CloudCommand); }
+  catch(const std::exception& error){std::cerr<<"native_error="<<error.what()<<std::endl;return 1;}
+}
+`);
+  const exportFlag=hostPlatform==='darwin'?'-Wl,-export_dynamic':'-Wl,--export-dynamic';
+  const frameworks=hostPlatform==='darwin'?[fileURLToPath(new URL('../native/bambu-cloud-identity.cpp',import.meta.url)),'-framework','Security','-framework','CoreFoundation']:[];
+  const build=spawnSync(process.env.CXX||'c++',['-std=c++17',driver,'-o',binary,exportFlag,'-ldl','-pthread',...frameworks],{encoding:'utf8',timeout:60000});
+  assert.equal(build.status,0,build.stderr);
+  const saved=Object.fromEntries(['TEST_REPLY','TEST_SENDS','TEST_AUTHORIZED','BAMBU_NATIVE_COMMAND_REPLY_SECONDS'].map(key=>[key,process.env[key]]));
+  t.after(()=>{for(const [key,value] of Object.entries(saved)){if(value===undefined)delete process.env[key];else process.env[key]=value;}});
+  process.env.BAMBU_NATIVE_HELPER=binary;process.env.BAMBU_NATIVE_PRINT_ROUTE='cloud';process.env.TEST_SENDS=sends;process.env.BAMBU_NATIVE_COMMAND_REPLY_SECONDS='1';
+  const control=(command,sequence,execution)=>sendCommandWithBambuNative({host:'127.0.0.1',serial:'20PTEST',token:'DUMMY',messageJson:JSON.stringify({print:{command,param:'',sequence_id:sequence}}),qos:1},execution);
+  const sent=async()=>{const lines=(await fs.readFile(sends,'utf8')).trim().split('\n');await fs.rm(sends);return lines.length;};
+
+  process.env.TEST_REPLY='success';
+  const paused=await control('pause','77');
+  assert.equal(paused.route,'bambu-cloud');
+  assert.equal(paused.printer_reply,'accepted');
+  assert.deepEqual(paused.updates.filter(line=>line.startsWith('native_command')),['native_command result=-2','native_command result=0','native_command_reply result=success err_code=0']);
+  assert.equal(await sent(),2,'one rejected publish before the certificate, one accepted');
+
+  // A fresh-state check runs before the first publish and again before the retry.
+  process.env.TEST_AUTHORIZED='1';
+  let checks=0;
+  const resumed=await control('resume','78',{beforeDispatch:async()=>{checks++;}});
+  assert.equal(resumed.printer_reply,'accepted');
+  assert.equal(checks,2);
+  assert.equal(await sent(),2);
+  checks=0;
+  await assert.rejects(control('resume','79',{beforeDispatch:async()=>{if(++checks===2)throw new Error('Printer is no longer paused');}}),/no longer paused/);
+  assert.equal(await sent(),1,'a failed recheck stops the retry');
+  delete process.env.TEST_AUTHORIZED;
+
+  process.env.TEST_REPLY='failed';
+  await assert.rejects(control('stop','80'),/printer rejected stop: result=failed reason=mqtt_message_verify_failed err_code=84033543/);
+  await sent();
+
+  process.env.TEST_REPLY='none';
+  const unanswered=await control('pause','81');
+  assert.match(unanswered.printer_reply,/^none: sent/);
+  await sent();
 });
