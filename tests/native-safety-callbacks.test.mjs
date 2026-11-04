@@ -97,10 +97,15 @@ test("native error clearing rechecks identical confirmed codes for every attempt
   const result = await s.printer.clearHmsErrors(host, serial, token, async (_active, beforeDispatch) => {
     await beforeDispatch?.();
     await beforeDispatch?.();
+    return { status: "success", route: "bambu-cloud", printer_reply: "accepted", updates: ["native_command result=0"] };
   });
   assert.equal(s.reads(), 4);
   assert.equal(s.confirmations(), 1);
   assert.deepEqual(result.cleared_codes, ["hms:1:131073", "print_error:123"]);
+  // The printer's own reply reaches the tool result; helper progress lines do not.
+  assert.equal(result.printer_reply, "accepted");
+  assert.equal(result.route, "bambu-cloud");
+  assert.equal(result.updates, undefined);
 });
 
 test("native heater-off needs neither fresh state nor confirmation", async t => {

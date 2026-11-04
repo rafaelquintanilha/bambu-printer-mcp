@@ -518,6 +518,13 @@ export function cameraFrameParser(onFrame: (jpeg: Buffer) => void, onError: (err
   };
 }
 
+/** The native route's route and printer reply, when a control returned them. */
+function nativeReply(result: unknown): Record<string, unknown> {
+  if (!result || typeof result !== "object") return {};
+  const { route, printer_reply } = result as Record<string, unknown>;
+  return { ...(route === undefined ? {} : { route }), ...(printer_reply === undefined ? {} : { printer_reply }) };
+}
+
 export class BambuImplementation {
   private printerStore: BambuClientStore;
   private checkedJobs = new Map<string, { remotePath: string; requirements: PrinterStateRequirements }>();
@@ -1115,9 +1122,10 @@ export class BambuImplementation {
       await beforeDispatch();
       const printer = dispatch ? undefined : await this.getPrinter(host, serial, token);
       assertActive();
-      if (dispatch) await dispatch(assertActive, beforeDispatch);
-      else await invokeWithoutAck(printer!, new UpdateStateCommand({ state: "resume" }));
-      return { status: "success", message: "Resume command sent successfully." };
+      // Keep the native route's printer reply (accepted, rejected or unconfirmed).
+      const sent = dispatch ? await dispatch(assertActive, beforeDispatch) : undefined;
+      if (!dispatch) await invokeWithoutAck(printer!, new UpdateStateCommand({ state: "resume" }));
+      return { ...nativeReply(sent), status: "success", message: "Resume command sent successfully." };
     });
   }
 
@@ -1150,14 +1158,15 @@ export class BambuImplementation {
       await beforeDispatch();
       const printer = dispatch ? undefined : await this.getPrinter(host, serial, token);
       assertActive();
-      if (dispatch) await dispatch(assertActive, beforeDispatch);
+      let sent: unknown;
+      if (dispatch) sent = await dispatch(assertActive, beforeDispatch);
       else {
         await beforeDispatch();
         await printer!.publish({ print: { command: "clean_print_error", sequence_id: "0" } });
       }
       this.clearedErrors.set(serial, codes);
       await sleep(COMMAND_SETTLE_MS);
-      return { status: "success", message: "Confirmed HMS clear command sent. The next print requires acknowledgment of these cleared codes.", cleared_codes: codes };
+      return { ...nativeReply(sent), status: "success", message: "Confirmed HMS clear command sent. The next print requires acknowledgment of these cleared codes.", cleared_codes: codes };
     });
   }
 
