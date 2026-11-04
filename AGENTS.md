@@ -1,26 +1,21 @@
 # bambu-printer-mcp
 
-This file is the repository's shared source of truth for local agents, GitHub Codex review, and scheduled maintenance. Read it before changing or reviewing code. CLAUDE.md and .claude/agents.md defer to these rules.
+This file is the repository's shared source of truth for local agents (Claude Code and Codex). Read it before changing or reviewing code. CLAUDE.md and .claude/agents.md defer to these rules.
 
-## Release and review
+## Workflow and commits
 
-- Every update to main requires an npm patch version bump and publication, including code, documentation, and configuration. Run `npm version patch` once for the release, and include its package.json, package-lock.json, and manifest.json changes in the same integration to main.
-- Before opening or updating a PR, run Matt Pocock's `code-review` skill against the main merge base. Resolve substantive standards and spec findings locally; keep its issue-tracker note as ignored agent scratch rather than adding another required public template.
-- Run the local `code-review` gate before pushing PR updates so problems are caught before spending on GitHub Actions. Use a PR to main, include `@codex review` in change commit messages, and request `@codex review` on the PR. After each update, wait at least five minutes and for Codex review plus CI to complete on the current head. Inspect inline findings as well as summary comments, fix actionable findings, and repeat. Local review supplements GitHub review and CI; it does not disable or replace either. A stale review or passing local test does not authorize ignoring current CI failures.
-- Prioritize substantive defects and regressions in supported workflows. Document and defer obscure edge cases, speculative hardening, and cosmetic objections instead of extending a sound release into an endless review loop.
-- Never add AI or agent attribution anywhere in Git or GitHub: no `Co-Authored-By` trailers for Claude, Codex, or other assistants, no "Generated with" footers, and no agent session links in commits, PR titles or bodies, review replies, issue comments, or release notes.
-- Preserve original authorship when integrating contributor PRs. Credit code, issue reports, hardware evidence, and useful superseded proposals in CONTRIBUTORS.md. Clearly distinguish merged changes, superseded proposals, and deferred work.
-- The main-branch Publish Package workflow runs the checks and `npm publish` using trusted publishing. Verify that workflow and the exact npm version before claiming publication; do not publish an unmerged release ahead of review.
-- Create a `v<version>` tag on the final merged release commit and a GitHub Release. The tag workflow builds and uploads the `.mcpb` extension. Verify npm, package/manifest versions, the release asset, and fresh installed startup before declaring the release complete. Never move a published tag.
-- After merging and verifying the release, switch back to main and delete the merged temporary integration branch locally and from origin.
-- Changes to src/, scripts/, or printer behavior need a present-tense CHANGELOG.md entry under `## Unreleased` while preparing the release. Run `npm version patch` only after accumulating the release notes: its version hook promotes that heading to the new version and date. If review adds notes after the bump, place them in that release's section. Released changes must never remain under `Unreleased` on main. Use that version's entries in GitHub release notes, with contributor credit and validation limits. Supply multiline notes via a body file.
-- Verify the Pages deployment on the merged release commit and read the live `/project/changelog` page before declaring a release complete. Confirm the latest version/date and changes appear under their released version, not `Unreleased`; a passing site build alone is insufficient.
+- This is Rafael's personal fork (`rafaelquintanilha/bambu-printer-mcp`) for his own printers, not a contribution flow. Do not open pull requests, create feature branches, request Codex or GitHub reviews, bump versions, publish to npm, tag releases or deploy the Pages site unless he asks.
+- Commit finished work directly to `main` and push it once `npm run build` passes and the relevant tests pass. Run the full `npm test` before pushing changes to src/, native/, scripts/ or tests/. If the checkout is on another branch that other sessions share, fast-forward `main` without switching: `git push origin HEAD:main` and `git fetch . HEAD:main`.
+- Fix substantive defects and regressions in the workflows Rafael uses: finding, slicing, uploading, printing, monitoring and controlling the X2D. Note cosmetic objections and speculative hardening for later instead of fixing them.
+- Never add AI or agent attribution anywhere in Git or GitHub: no `Co-Authored-By` trailers for Claude, Codex, or other assistants, no "Generated with" footers, and no agent session links in commits, issue comments, or notes.
+- Add a present-tense CHANGELOG.md entry under `## Unreleased` for changes to src/, native/, scripts/ or printer behavior.
+- When pulling changes from the upstream project (`DMontgomery40/bambu-printer-mcp`), preserve original authorship and the credit in CONTRIBUTORS.md.
 
 ## Build and test
 
 - `npm run build` must finish with zero TypeScript errors before committing. Keep tracked dist/ output synchronized with source.
 - `node --test tests/behavior.test.mjs` must pass all current tests before pushing. Do not rely on an old fixed test count.
-- `npm test` builds and runs the full suite, including printer routing/status, slicer safety, Blender MCP, real npm installation layouts, and desktop packaging. It must pass before release; CI uses Node.js 24 on Linux.
+- `npm test` builds and runs the full suite, including printer routing/status, slicer safety, Blender MCP, real npm installation layouts, and desktop packaging. It must pass before pushing code changes to main; CI uses Node.js 24 on Linux.
 - Tests use compiled dist/ files, so build before focused test commands. Optional tests against an installed BambuStudio profile tree may skip when that tree or model is unavailable; report those skips separately from failures.
 - For installation changes, test the actual tarball in local-hoisted, global, and npm-exec layouts and check the patched dependency at runtime. For desktop changes, inspect and initialize the extracted MCPB archive.
 - Do not start physical prints or mutate the user's live Blender scene during routine tests. Use dummy printer credentials, mocked transport boundaries, and isolated headless Blender. Set BAMBU_MODEL explicitly to an empty string in tests of missing-model behavior so dotenv cannot supply a real configuration.
