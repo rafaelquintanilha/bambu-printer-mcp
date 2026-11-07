@@ -361,6 +361,21 @@ for (const [label, options, message] of [
   });
 }
 
+// iCloud can offload the helper; macOS then kills it at launch. The server reads
+// the helper and its identity library first, and stops when it cannot.
+for (const [label, name, mode] of [["helper", "helper.mjs", 0o111], ["identity library", "libbambu-cloud-identity.dylib", 0o000]]) {
+  test(`macOS X2D print with an unreadable ${label} stops before launching it`, { skip: process.getuid?.() === 0 && "root can read any file" }, async t => {
+    const s = await server(t);
+    const file = path.join(s.dir, name);
+    if (name !== "helper.mjs") await fs.writeFile(file, "");
+    await fs.chmod(file, mode);
+    const result = await s.print({ use_ams: false });
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, new RegExp(`Could not read .*${name.replace(".", "\\.")} before launching the native helper.*nothing was sent`));
+    assert.equal((await s.events()).some(e => ["helper", "ftp", "mqtt"].includes(e.kind)), false);
+  });
+}
+
 test("Windows X2D print fails with a platform error before touching the printer", async t => {
   const s = await server(t, { platform: "win32", model: "" });
   const result = await s.print({ use_ams: false });

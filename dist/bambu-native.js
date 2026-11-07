@@ -137,6 +137,26 @@ function isRegularFile(file) {
     }
 }
 /**
+ * iCloud Drive offloads files in synced folders such as ~/Documents when the
+ * disk runs low. macOS kills a program launched from an offloaded file
+ * ("Code Signature Invalid") before it runs, while a read restores the file.
+ * Read the helper and its identity library in full just before each launch.
+ */
+function restoreHelperFiles(helper) {
+    for (const file of [helper, path.join(path.dirname(helper), "libbambu-cloud-identity.dylib")]) {
+        if (file !== helper && !isRegularFile(file))
+            continue;
+        try {
+            fs.readFileSync(file);
+        }
+        catch (error) {
+            const reason = error instanceof Error ? error.message : String(error);
+            throw new Error(`Could not read ${file} before launching the native helper (${reason}). ` +
+                "If it is in an iCloud-synced folder, let iCloud download it or free disk space, then retry; nothing was sent.");
+        }
+    }
+}
+/**
  * Resolve a complete native installation. On Linux the helper, the pinned
  * plug-in and both certificates must be present before any native route is
  * chosen, and their resolved paths are handed to the helper so server and
@@ -154,6 +174,7 @@ export function resolveNativeInstall() {
         if (samePath(helper, local) && !nativeHelperReceiptMatches(`${local}-source.json`, path.dirname(local))) {
             throw new Error("The native helper was built from older source. Run `npm run build:native`, then retry; nothing was sent.");
         }
+        restoreHelperFiles(helper);
         return { helper, env: {} };
     }
     const managed = bambuNativeManagedPaths();
