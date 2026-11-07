@@ -695,6 +695,20 @@ test('X2D banner separators, M9711 timelapse and N nozzle index pass only on dua
   for(const command of ['======== M104 S400 ========','==== G1 X0 ====','=== T0 ===','========','= =','M9711 M0 E2 Z1.4 S11 C10 O0 T3000','M9711 M0 E-1 Z1.4 S11 C10 O0 T3000','M9711 M0 E0.5 Z1.4 S11 C10 O0 T3000','M9711 M0 E0 Z1.4 S11 C10 O0 T3000 P1','M9711 E0 Z1.4 S11 C10 O0 T3000','M9711 M0 Z1.4 S11 C10 O0 T3000','M9711 M0 E0 Z1.4 S12 C10 O0 T3000','M9711 M0 E0 Z1.4 S11 C10 O0','M9711 M0 E0 Z1.4 S11 C10 O0 T3000 M104 S400','M9711 M0 E0 Z{layer_z} S11 C10 O0 T3000','M104 S220 N2','M104 S220 N-1','M104 S220 N0.5','M104 S220 N','M140 S55 N0','M191 S40 N0','M104 S400 N0','M104 T1 S400 N0','M109 R400 N1'])
     await assert.rejects(inspect(t,x2dHeader()+command+'\n',{model:'x2d'}),/unsupported|syntax|parameter|temperature|limit|nozzle|dynamic|multiple/i,command);
 });
+// Bambu Studio GCodeWriter::set_temperature writes `M104 M S<target> [T<tool>]` on the
+// second layer when nozzle_temperature differs from nozzle_temperature_initial_layer,
+// e.g. Bambu PETG HF @BBL X2D 0.4 nozzle: 230 C first layer, then 245 C.
+test('layer-change M104 M marker passes with its target still checked',async t=>{
+  const r=await inspect(t,x2dHeader('PETG;PETG')+'M104 S230 A\nT0\nG1 X10 Y10 E1\nM104 M S245 ; set nozzle temperature\n',{model:'x2d'});
+  assert.equal(r.maxNozzleTemperature,245);
+  for(const [model,nozzle] of [['P1S','0.4'],['A1','0.4'],['H2D','0.4;0.4']]) {
+    const extra=nozzle.includes(';')?'M104 M S245 T1\n':'';
+    const s=await inspect(t,header(model,'PETG',nozzle)+'M104 S230\nM104 M S245\n'+extra,{model:model.toLowerCase()});
+    assert.equal(s.maxNozzleTemperature,245,model);
+  }
+  for(const command of ['M104 M S400','M104 M','M104 M T0','M104 M1 S245','M104 M0 S245','M104 M M S245','M104 M S{nozzle_temperature}','M109 M S245','M140 M S60','M190 M S60','M141 M S40'])
+    await assert.rejects(inspect(t,x2dHeader('PETG;PETG')+'M104 S230\n'+command+'\n',{model:'x2d'}),/unsupported|syntax|parameter|temperature|limit|target|duplicate|dynamic/i,command);
+});
 test('pinned official X2D 02.08 change-filament and timelapse templates are inspected literally',async t=>{
   // BambuStudio v02.08.02.61, resources/profiles/BBL/machine/Bambu Lab X2D 0.4 nozzle template <name>.json
   const hashes={change_filament_gcode:'0c10a06ad5f6fb9062082b10edaab5ce465962db1dc2d6ffdccea0f0409748d1',time_lapse_gcode:'65b30d1bfb5f2d5043e7da71cade5c1e561fa596029d9fcd0a171835a5e6a542'};

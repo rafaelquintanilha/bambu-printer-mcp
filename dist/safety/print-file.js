@@ -537,7 +537,7 @@ export async function inspectPrintFile(filePath, options) {
                 continue;
             }
             if (['M104', 'M109', 'M140', 'M190', 'M141', 'M191'].includes(code)) {
-                const args = parameters(argumentsText, 'A');
+                const args = parameters(argumentsText, code === 'M104' ? 'AM' : 'A');
                 // Official A1 and A1 mini start G-code waits with M109 S<target> H<limit>
                 // (S25 H140, S100 H170, S220 H300). H is not a heater target: S stays the
                 // checked target, so H is accepted only within those vendor bounds.
@@ -569,8 +569,13 @@ export async function inspectPrintFile(filePath, options) {
                 // N selects a nozzle, never a target, so it is accepted only on those models,
                 // only for nozzle heaters, and only within the declared nozzle count.
                 const nozzleIndex = ['M104', 'M109'].includes(code) && dualNozzle;
+                // Bambu Studio marks the second-layer switch from nozzle_temperature_initial_layer
+                // to nozzle_temperature as `M104 M S<target> [T<tool>]` on every model
+                // (GCodeWriter::set_temperature with TemperatureCommandType::LayerChange).
+                // The bare M is a marker, never a target or selector; S is still checked below.
+                const layerChange = code === 'M104' && args.has('M') && Number.isNaN(args.get('M'));
                 for (const key of args.keys())
-                    if (!'SRTA'.includes(key) && !(key === 'H' && vendorWait) && !(key === 'N' && nozzleIndex))
+                    if (!'SRTA'.includes(key) && !(key === 'H' && vendorWait) && !(key === 'N' && nozzleIndex) && !(key === 'M' && layerChange))
                         fail(`unsupported ${code} temperature parameter ${key}`);
                 if (args.has('N') && (!Number.isInteger(args.get('N')) || args.get('N') < 0 || args.get('N') >= Math.min(nozzleDiameters.length, 2)))
                     fail(`unsupported ${code} nozzle index N`);
